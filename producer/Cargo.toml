@@ -1,0 +1,17 @@
+[package]
+name = "producer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+openssl.workspace = true
+tokio-postgres.workspace = true
+postgres-protocol.workspace = true
+postgres-openssl.workspace = true
+lazy_static.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true

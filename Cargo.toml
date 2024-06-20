@@ -1,0 +1,18 @@
+[workspace]
+
+resolver = "2"
+
+members = ["producer"]
+
+[workspace.dependencies]
+anyhow = "1.0.66"
+async-trait = "0.1"
+futures = { version = "0.3.25", features = ["executor"] }
+openssl = { version = "0.10.38", features = ["vendored"] }
+tokio-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", branch = "mz-0.7.2" }
+postgres-protocol = { git = "https://github.com/MaterializeInc/rust-postgres", branch = "mz-0.7.2" }
+postgres-openssl = { git = "https://github.com/MaterializeInc/rust-postgres", branch = "mz-0.7.2" }
+lazy_static = "1.4.0"
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
+tokio = { version = "1.16.1", features = ["fs", "rt", "sync", "macros"] }
