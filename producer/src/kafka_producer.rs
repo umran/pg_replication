@@ -44,6 +44,9 @@ impl ProducerContext for KafkaProducerContext {
         delivery_opaque: Self::DeliveryOpaque,
     ) {
         if let Ok(_) = delivery_result {
+            // it's safe to unwrap here because it will only panic if called in an async
+            // context (which we're not) or if the receiver has been dropped. If the receiver is dropped
+            // it means the main task has exited so it doesn't matter if we panic here
             self.committed_lsn_tx
                 .blocking_send(*delivery_opaque)
                 .unwrap();
