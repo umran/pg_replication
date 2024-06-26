@@ -127,7 +127,7 @@ impl Producer {
             util::publication_info(&client, &self.publication_name, &self.topic_map).await?;
 
         let kafka_producer = KafkaProducer::new(self.kafka_brokers.clone());
-        let (replication_op_tx, mut committed_lsn_rx) = kafka_producer.produce()?;
+        let (msg_tx, mut committed_lsn_rx) = kafka_producer.produce()?;
 
         let confirmed_flush_lsn = Arc::new(RwLock::new(slot_meta_data.confirmed_flush_lsn));
         let confirmed_flush_lsn_clone = confirmed_flush_lsn.clone();
@@ -224,11 +224,9 @@ impl Producer {
                                 &publication_tables,
                             )?;
 
-                            try_recoverable!(replication_op_tx.send(message).await.map_err(
-                                |_| anyhow!(
-                                    "unable to produce replication message to producer tx channel"
-                                )
-                            ));
+                            try_recoverable!(msg_tx.send(message).await.map_err(|_| anyhow!(
+                                "unable to produce replication message to producer tx channel"
+                            )));
 
                             seq_id += 1;
                         }
@@ -266,11 +264,9 @@ impl Producer {
                                 &publication_tables,
                             )?;
 
-                            try_recoverable!(replication_op_tx.send(message).await.map_err(
-                                |_| anyhow!(
-                                    "unable to produce replication message to producer tx channel"
-                                )
-                            ));
+                            try_recoverable!(msg_tx.send(message).await.map_err(|_| anyhow!(
+                                "unable to produce replication message to producer tx channel"
+                            )));
 
                             seq_id += 1;
                         }
@@ -295,11 +291,9 @@ impl Producer {
                                 &publication_tables,
                             )?;
 
-                            try_recoverable!(replication_op_tx.send(message).await.map_err(
-                                |_| anyhow!(
-                                    "unable to produce replication message to producer tx channel"
-                                )
-                            ));
+                            try_recoverable!(msg_tx.send(message).await.map_err(|_| anyhow!(
+                                "unable to produce replication message to producer tx channel"
+                            )));
 
                             seq_id += 1;
                         }
