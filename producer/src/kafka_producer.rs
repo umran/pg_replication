@@ -14,6 +14,8 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 
+use crate::error::ReplicationError;
+
 #[derive(Clone)]
 pub struct KafkaProducer {
     brokers: String,
@@ -54,7 +56,9 @@ impl KafkaProducer {
         Self { brokers }
     }
 
-    pub fn produce<T>(&self) -> (Sender<KafkaProducerMessage<T>>, Receiver<u64>)
+    pub fn produce<T>(
+        &self,
+    ) -> Result<(Sender<KafkaProducerMessage<T>>, Receiver<u64>), ReplicationError>
     where
         T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
     {
@@ -70,8 +74,10 @@ impl KafkaProducer {
         let producer: ThreadedProducer<_> = ClientConfig::new()
             .set("bootstrap.servers", &self.brokers)
             .set("message.timeout.ms", "5000")
-            .create_with_context(context)
-            .unwrap();
+            .set("max.in.flight.requests.per.connection", "5")
+            .set("enable.idempotence", "true")
+            .set("acks", "all")
+            .create_with_context(context)?;
 
         tokio::task::spawn_blocking(move || {
             while let Some(msg) = msg_rx.blocking_recv() {
@@ -85,18 +91,24 @@ impl KafkaProducer {
                     match producer.send(record) {
                         Ok(()) => break,
                         Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), rec)) => {
-                            // Retry after 500ms
+                            tracing::warn!("Send queue full, will retry");
+
                             record = rec;
                             thread::sleep(Duration::from_millis(500));
                         }
                         Err((e, _)) => {
-                            panic!("Failed to publish to kafka {:?}", e);
+                            tracing::error!(
+                                "Failed to publish message to kafka, will panic {:?}",
+                                e
+                            );
+
+                            panic!("Failed to enqueue message with potentially fatal error!")
                         }
                     }
                 }
             }
         });
 
-        (msg_tx, committed_lsn_rx)
+        Ok((msg_tx, committed_lsn_rx))
     }
 }

@@ -1,5 +1,6 @@
 use std::error::Error;
 
+use rdkafka::error::KafkaError;
 use tokio_postgres::error::{DbError, Severity, SqlState};
 
 pub trait ErrorExt {
@@ -17,6 +18,17 @@ impl<E: ErrorExt + Into<anyhow::Error>> From<E> for ReplicationError {
             Self::Recoverable(err.into())
         } else {
             Self::Fatal(err.into())
+        }
+    }
+}
+
+impl ErrorExt for KafkaError {
+    fn is_recoverable(&self) -> bool {
+        use KafkaError::*;
+
+        match self {
+            ClientCreation(..) | ClientConfig(..) => false,
+            _ => true,
         }
     }
 }
