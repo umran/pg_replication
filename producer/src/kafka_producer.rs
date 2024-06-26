@@ -45,7 +45,7 @@ impl ProducerContext for KafkaProducerContext {
             // We don't care if the send fails here as it can only fail if the receiver has been dropped.
             // If the receiver has beend dropped it means the main task has exited and all spawned tasks
             // will get cleaned up by tokio
-            self.committed_lsn_tx.blocking_send(*delivery_opaque);
+            let _ = self.committed_lsn_tx.blocking_send(*delivery_opaque);
         }
     }
 }
