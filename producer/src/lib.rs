@@ -15,12 +15,14 @@ use postgres_protocol::message::backend::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::replication::LogicalReplicationStream;
-use tokio_postgres::SimpleQueryMessage;
+use tokio_postgres::types::PgLsn;
+use tokio_postgres::Client;
 
 use error::ReplicationError;
-use kafka_producer::KafkaProducer;
-use util::TopicInfo;
+use kafka_producer::{KafkaProducer, KafkaProducerMessage};
+use util::{TableInfo, TopicInfo};
 
 lazy_static! {
     /// Postgres epoch is 2000-01-01T00:00:00Z
@@ -52,14 +54,13 @@ pub struct Producer {
     slot_name: String,
     publication_name: String,
     topic_map: HashMap<String, TopicInfo>,
-    consistent_point: Arc<RwLock<u64>>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct ReplicationOp {
     pub rel_id: u32,
-    pub seq_id: u32,
     pub lsn: u64,
-    pub prev_lsn: u64,
+    pub seq_id: u64,
     pub op: Op,
 }
 
@@ -71,6 +72,11 @@ pub enum Op {
 }
 
 pub type Row = Vec<Option<String>>;
+
+struct SlotMetadata {
+    confirmed_flush_lsn: u64,
+    active_pid: Option<i32>,
+}
 
 impl Producer {
     /// Constructs a new instance
@@ -87,13 +93,10 @@ impl Producer {
             slot_name,
             publication_name,
             topic_map,
-            consistent_point: Arc::new(RwLock::new(0)),
         }
     }
 
-    pub async fn start(&mut self) -> Result<(), ReplicationError> {
-        self.create_slot().await?;
-
+    pub async fn start(&mut self) -> Result<(), anyhow::Error> {
         loop {
             match self.start_replication().await {
                 Err(ReplicationError::Recoverable(e)) => {
@@ -103,7 +106,7 @@ impl Producer {
                         e
                     )
                 }
-                Err(ReplicationError::Fatal(e)) => return Err(ReplicationError::Fatal(e)),
+                Err(ReplicationError::Fatal(e)) => return Err(e),
                 Ok(_) => unreachable!("replication stream cannot exit without an error"),
             }
 
@@ -112,140 +115,40 @@ impl Producer {
         }
     }
 
-    async fn create_slot(&mut self) -> Result<(), ReplicationError> {
+    async fn start_replication(&mut self) -> Result<(), ReplicationError> {
         let client = try_recoverable!(util::connect_replication(&self.connection_string).await);
 
-        // Start a transaction and immediatelly create a replication slot with the USE SNAPSHOT
-        // directive. This makes the starting point of the slot and the snapshot of the transaction
-        // identical.
-        client
-            .simple_query("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ;")
-            .await?;
+        ensure_replication_slot(&client, &self.slot_name).await?;
 
-        // retrieve the list of replication slots
-        let get_slots_query =
-            "SELECT slot_name, slot_type, plugin, restart_lsn FROM pg_replication_slots";
+        let slot_meta_data =
+            fetch_slot_metadata(&client, &self.slot_name, Duration::from_secs(3)).await?;
 
-        let slot_rows = client
-            .simple_query(get_slots_query)
-            .await?
-            .into_iter()
-            .filter_map(|msg| match msg {
-                SimpleQueryMessage::Row(row) => Some(row),
-                _ => None,
-            });
-
-        for slot_row in slot_rows {
-            let slot_name = try_recoverable!(slot_row
-                .get("slot_name")
-                .ok_or_else(|| anyhow!("missing expected column: `slot_name`")));
-
-            if slot_name != self.slot_name {
-                continue;
-            }
-
-            // we've found an existing slot by the same name. check that it is a logical pgoutput slot
-            let slot_type = try_recoverable!(slot_row
-                .get("slot_type")
-                .ok_or_else(|| anyhow!("missing expected column: `slot_type`")));
-
-            let plugin = try_recoverable!(slot_row
-                .get("plugin")
-                .ok_or_else(|| anyhow!("missing expected column: `plugin`")));
-
-            if slot_type != "logical" {
-                return Err(ReplicationError::Fatal(anyhow!("a replication slot by the same name already exists, but it's type is not logical and therefore cannot be used for replication by this programme")));
-            }
-
-            if plugin != "pgoutput" {
-                return Err(ReplicationError::Fatal(anyhow!("a logical replication slot by the same name already exists, but it's plugin is not pgoutput and therefore cannot be used for replication by this programme")));
-            }
-
-            let consistent_point = try_recoverable!(slot_row
-                .get("restart_lsn")
-                .ok_or_else(|| anyhow!("missing expected column: `restart_lsn`")));
-
-            let consistent_point: u64 = try_fatal!(consistent_point
-                .parse()
-                .or_else(|_| Err(anyhow!("invalid lsn"))));
-
-            self.consistent_point = Arc::new(RwLock::new(consistent_point));
-
-            client.simple_query("COMMIT;").await?;
-
-            return Ok(());
-        }
-
-        let create_slot_query = format!(
-            r#"CREATE_REPLICATION_SLOT {:?} LOGICAL "pgoutput" USE_SNAPSHOT"#,
-            &self.slot_name
-        );
-
-        let created_slot_row = client
-            .simple_query(&create_slot_query)
-            .await?
-            .into_iter()
-            .next()
-            .and_then(|msg| match msg {
-                SimpleQueryMessage::Row(row) => Some(row),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                ReplicationError::Recoverable(anyhow!(
-                    "empty result after creating replication slot"
-                ))
-            })?;
-
-        // Store the lsn at which we will need to start the replication stream from
-        let consistent_point = try_recoverable!(created_slot_row
-            .get("consistent_point")
-            .ok_or_else(|| anyhow!("missing expected column: `consistent_point`")));
-
-        let consistent_point: u64 = try_fatal!(consistent_point
-            .parse()
-            .or_else(|_| Err(anyhow!("invalid lsn"))));
-
-        self.consistent_point = Arc::new(RwLock::new(consistent_point));
-
-        client.simple_query("COMMIT;").await?;
-
-        Ok(())
-    }
-
-    async fn start_replication(&mut self) -> Result<(), ReplicationError> {
-        use ReplicationError::*;
-
-        let publication_tables = try_recoverable!(
-            util::publication_info(
-                &self.connection_string,
-                &self.publication_name,
-                &self.topic_map
-            )
-            .await
-        );
+        let publication_tables =
+            util::publication_info(&client, &self.publication_name, &self.topic_map).await?;
 
         let kafka_producer = KafkaProducer::new(self.kafka_brokers.clone());
-        let (replication_op_tx, mut committed_lsn_rx) = kafka_producer.produce(publication_tables);
+        let (replication_op_tx, mut committed_lsn_rx) = kafka_producer.produce();
 
-        let consistent_point = self.consistent_point.clone();
+        let confirmed_flush_lsn = Arc::new(RwLock::new(slot_meta_data.confirmed_flush_lsn));
+        let confirmed_flush_lsn_clone = confirmed_flush_lsn.clone();
 
         tokio::spawn(async move {
             while let Some(committed_lsn) = committed_lsn_rx.recv().await {
-                if committed_lsn > *consistent_point.read().await {
-                    let mut consistent_point = consistent_point.write().await;
-                    *consistent_point = committed_lsn
+                if committed_lsn > *confirmed_flush_lsn_clone.read().await {
+                    let mut confirmed_flush_lsn = confirmed_flush_lsn_clone.write().await;
+                    *confirmed_flush_lsn = committed_lsn
                 }
             }
         });
 
-        // todo(umran): pass configuration via dep injection
-        let client = try_recoverable!(util::connect_replication(&self.connection_string).await);
+        // kill any active pid that is already bound to the slot before attempting to start replication
+        kill_active_pid(&client, slot_meta_data.active_pid).await;
 
         let query = format!(
             r#"START_REPLICATION SLOT "{name}" LOGICAL {lsn}
             ("proto_version" '1', "publication_names" '{publication}')"#,
             name = &self.slot_name,
-            lsn = *self.consistent_point.read().await,
+            lsn = *confirmed_flush_lsn.read().await,
             publication = self.publication_name
         );
         let copy_stream = try_recoverable!(client.copy_both_simple(&query).await);
@@ -257,7 +160,7 @@ impl Producer {
 
         let mut seq_id = 0;
         let mut tx_in_progress = false;
-        let mut prev_lsn = *self.consistent_point.read().await;
+        let mut prev_lsn = *confirmed_flush_lsn.read().await;
         let mut lsn = prev_lsn;
 
         while let Some(item) = stream.try_next().await? {
@@ -279,7 +182,7 @@ impl Producer {
                     .try_into()
                     .expect("software more than 200k years old, consider updating");
 
-                let lsn = *self.consistent_point.read().await;
+                let lsn = *confirmed_flush_lsn.read().await;
                 let lsn = lsn.into();
 
                 try_recoverable!(
@@ -298,7 +201,7 @@ impl Producer {
                     match xlog_data.data() {
                         Begin(begin) => {
                             if tx_in_progress {
-                                return Err(Fatal(anyhow!("received a begin before commit for the previous transaction! this is a bug!")));
+                                return Err(ReplicationError::Fatal(anyhow!("received a begin before commit for the previous transaction! this is a bug!")));
                             }
 
                             tx_in_progress = true;
@@ -309,28 +212,29 @@ impl Producer {
                         Insert(insert) => {
                             let rel_id = insert.rel_id();
                             let new_tuple = insert.tuple().tuple_data();
-
                             let row = try_fatal!(row_from_tuple_data(rel_id, new_tuple));
-
                             let op = Op::Insert(row);
 
-                            try_fatal!(replication_op_tx
-                                .send(ReplicationOp {
-                                    rel_id,
-                                    lsn,
-                                    prev_lsn,
-                                    seq_id,
-                                    op
-                                })
-                                .await
-                                .map_err(|_| anyhow!(
+                            let message = message_from_op(
+                                rel_id,
+                                lsn,
+                                prev_lsn,
+                                seq_id,
+                                op,
+                                &publication_tables,
+                            )?;
+
+                            try_recoverable!(replication_op_tx.send(message).await.map_err(
+                                |_| anyhow!(
                                     "unable to produce replication message to producer tx channel"
-                                )));
+                                )
+                            ));
 
                             seq_id += 1;
                         }
                         Update(update) => {
                             let rel_id = update.rel_id();
+
                             let old_tuple = try_fatal!(update
                                             .old_tuple()
                                             .ok_or_else(|| anyhow!("Old row missing from replication stream for table with OID = {}. \
@@ -351,26 +255,28 @@ impl Producer {
 
                             let old_row = try_fatal!(row_from_tuple_data(rel_id, old_tuple));
                             let new_row = try_fatal!(row_from_tuple_data(rel_id, new_tuple));
-
                             let op = Op::Update((old_row, new_row));
 
-                            try_fatal!(replication_op_tx
-                                .send(ReplicationOp {
-                                    rel_id,
-                                    lsn,
-                                    prev_lsn,
-                                    seq_id,
-                                    op
-                                })
-                                .await
-                                .map_err(|_| anyhow!(
+                            let message = message_from_op(
+                                rel_id,
+                                lsn,
+                                prev_lsn,
+                                seq_id,
+                                op,
+                                &publication_tables,
+                            )?;
+
+                            try_recoverable!(replication_op_tx.send(message).await.map_err(
+                                |_| anyhow!(
                                     "unable to produce replication message to producer tx channel"
-                                )));
+                                )
+                            ));
 
                             seq_id += 1;
                         }
                         Delete(delete) => {
                             let rel_id = delete.rel_id();
+
                             let old_tuple = try_fatal!(delete
                                             .old_tuple()
                                             .ok_or_else(|| anyhow!("Old row missing from replication stream for table with OID = {}. \
@@ -378,21 +284,22 @@ impl Producer {
                                         .tuple_data();
 
                             let row = try_fatal!(row_from_tuple_data(rel_id, old_tuple));
-
                             let op = Op::Delete(row);
 
-                            try_fatal!(replication_op_tx
-                                .send(ReplicationOp {
-                                    rel_id,
-                                    lsn,
-                                    prev_lsn,
-                                    seq_id,
-                                    op
-                                })
-                                .await
-                                .map_err(|_| anyhow!(
+                            let message = message_from_op(
+                                rel_id,
+                                lsn,
+                                prev_lsn,
+                                seq_id,
+                                op,
+                                &publication_tables,
+                            )?;
+
+                            try_recoverable!(replication_op_tx.send(message).await.map_err(
+                                |_| anyhow!(
                                     "unable to produce replication message to producer tx channel"
-                                )));
+                                )
+                            ));
 
                             seq_id += 1;
                         }
@@ -402,20 +309,133 @@ impl Producer {
                         Origin(_) | Relation(_) | Type(_) => {
                             // Ignored
                         }
-                        Truncate(_) => return Err(Fatal(anyhow!("source table got truncated"))),
+                        Truncate(_) => {
+                            return Err(ReplicationError::Fatal(anyhow!(
+                                "source table got truncated"
+                            )))
+                        }
                         // The enum is marked as non_exaustive. Better to be conservative here in
                         // case a new message is relevant to the semantics of our source
-                        _ => return Err(Fatal(anyhow!("unexpected logical replication message"))),
+                        _ => {
+                            return Err(ReplicationError::Fatal(anyhow!(
+                                "unexpected logical replication message"
+                            )))
+                        }
                     }
                 }
                 // Handled above
                 PrimaryKeepAlive(_) => {}
                 // The enum is marked non_exaustive, better be conservative
-                _ => return Err(Fatal(anyhow!("Unexpected replication message"))),
+                _ => {
+                    return Err(ReplicationError::Fatal(anyhow!(
+                        "Unexpected replication message"
+                    )))
+                }
             }
         }
 
-        Err(Recoverable(anyhow!("replication stream ended")))
+        Err(ReplicationError::Recoverable(anyhow!(
+            "replication stream ended"
+        )))
+    }
+}
+
+async fn ensure_replication_slot(client: &Client, slot: &str) -> Result<(), ReplicationError> {
+    match client
+        .execute(
+            "CREATE_REPLICATION_SLOT $1 LOGICAL \"pgoutput\" NOEXPORT_SNAPSHOT",
+            &[&slot],
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) if err.code() == Some(&SqlState::DUPLICATE_OBJECT) => Ok(()),
+        Err(_) => Err(ReplicationError::Recoverable(anyhow!(
+            "transient postgres error"
+        ))),
+    }
+}
+
+async fn fetch_slot_metadata(
+    client: &Client,
+    slot: &str,
+    interval: Duration,
+) -> Result<SlotMetadata, ReplicationError> {
+    loop {
+        let query = "SELECT active_pid, confirmed_flush_lsn
+                FROM pg_replication_slots WHERE slot_name = $1";
+
+        let Some(row) = client.query_opt(query, &[&slot]).await? else {
+            return Err(ReplicationError::Recoverable(anyhow!(
+                "missing replication slot"
+            )));
+        };
+
+        match row.get::<_, Option<PgLsn>>("confirmed_flush_lsn") {
+            Some(lsn) => {
+                return Ok(SlotMetadata {
+                    confirmed_flush_lsn: lsn.into(),
+                    active_pid: row.get("active_pid"),
+                })
+            }
+            // It can happen that confirmed_flush_lsn is NULL as the slot initializes
+            // This could probably be a `tokio::time::interval`, but its only is called twice,
+            // so its fine like this.
+            None => tokio::time::sleep(interval).await,
+        };
+    }
+}
+
+async fn kill_active_pid(client: &Client, active_pid: Option<i32>) {
+    // We're the only application that should be using this replication
+    // slot. The only way that there can be another connection using
+    // this slot under normal operation is if there's a stale TCP
+    // connection from a prior incarnation of the source holding on to
+    // the slot. We don't want to wait for the WAL sender timeout and/or
+    // TCP keepalives to time out that connection, because these values
+    // are generally under the control of the DBA and may not time out
+    // the connection for multiple minutes, or at all. Instead we just
+    // force kill the connection that's using the slot.
+    //
+    // Note that there's a small risk that *we're* the zombie cluster
+    // that should not be using the replication slot. Kubernetes cannot
+    // 100% guarantee that only one cluster is alive at a time. However,
+    // this situation should not last long, and the worst that can
+    // happen is a bit of transient thrashing over ownership of the
+    // replication slot.
+    if let Some(active_pid) = active_pid {
+        tracing::warn!(
+            %active_pid,
+            "replication slot already in use; will attempt to kill existing connection",
+        );
+
+        match client
+            .execute("SELECT pg_terminate_backend($1)", &[&active_pid])
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    "successfully killed existing connection; \
+                    starting replication is likely to succeed"
+                );
+                // Note that `pg_terminate_backend` does not wait for
+                // the termination of the targeted connection to
+                // complete. We may try to start replication before the
+                // targeted connection has cleaned up its state. That's
+                // okay. If that happens we'll just try again from the
+                // top via the suspend-and-restart flow.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    "failed to kill existing replication connection; \
+                    replication will likely fail to start"
+                );
+                // Continue on anyway, just in case the replication slot
+                // is actually available. Maybe PostgreSQL has some
+                // staleness when it reports `active_pid`, for example.
+            }
+        }
     }
 }
 
@@ -440,4 +460,38 @@ where
     }
 
     Ok(data)
+}
+
+fn message_from_op(
+    rel_id: u32,
+    lsn: u64,
+    prev_lsn: u64,
+    seq_id: u64,
+    op: Op,
+    publication_tables: &HashMap<u32, TableInfo>,
+) -> Result<KafkaProducerMessage<ReplicationOp>, ReplicationError> {
+    let table_info = try_fatal!(publication_tables.get(&rel_id).ok_or_else(|| anyhow!(
+        "table info for the received rel_id does not exisit in publication"
+    )));
+
+    let topic = table_info.topic.clone();
+
+    let partition_key = try_fatal!(match &op {
+        Op::Insert(row) => table_info.extract_partition_key(row),
+        Op::Update((_, row)) => table_info.extract_partition_key(row),
+        Op::Delete(row) => table_info.extract_partition_key(row),
+    })
+    .join("");
+
+    Ok(KafkaProducerMessage {
+        topic,
+        partition_key,
+        prev_lsn,
+        payload: ReplicationOp {
+            rel_id,
+            lsn,
+            seq_id,
+            op,
+        },
+    })
 }

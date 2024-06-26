@@ -8,6 +8,8 @@ use tokio_postgres::config::{ReplicationMode, SslMode};
 use tokio_postgres::types::Type as PgType;
 use tokio_postgres::{Client, Config};
 
+use crate::error::ReplicationError;
+
 mod task;
 
 #[derive(Serialize, Deserialize)]
@@ -178,15 +180,10 @@ pub async fn connect_replication(conn: &str) -> Result<Client, anyhow::Error> {
 /// - Invalid connection string, user information, or user permissions.
 /// - Upstream publication does not exist or contains invalid values.
 pub async fn publication_info(
-    conn: &str,
+    client: &Client,
     publication: &str,
     topic_map: &HashMap<String, TopicInfo>,
-) -> Result<HashMap<u32, TableInfo>, anyhow::Error> {
-    let config = conn.parse()?;
-    let tls = make_tls(&config)?;
-    let (client, connection) = config.connect(tls).await?;
-    task::spawn(|| format!("postgres_publication_info:{conn}"), connection);
-
+) -> Result<HashMap<u32, TableInfo>, ReplicationError> {
     client
         .query(
             "SELECT oid FROM pg_publication WHERE pubname = $1",
@@ -194,7 +191,9 @@ pub async fn publication_info(
         )
         .await?
         .get(0)
-        .ok_or_else(|| anyhow!("publication {:?} does not exist", publication))?;
+        .ok_or_else(|| {
+            ReplicationError::Fatal(anyhow!("publication {:?} does not exist", publication))
+        })?;
 
     let tables = client
         .query(
@@ -220,15 +219,15 @@ pub async fn publication_info(
 
         let topic_info = topic_map
             .get(&name)
-            .ok_or_else(|| anyhow!("TopicInfo missing for table"))?;
+            .ok_or_else(|| ReplicationError::Fatal(anyhow!("TopicInfo missing for table")))?;
 
         // check that there is at least one partition_key column defined in TopicInfo
         // 1-1 correspondence between columns defined in TopicInfo and the table schema
         // is checked below
         if topic_info.partition_key.len() == 0 {
-            return Err(anyhow!(
+            return Err(ReplicationError::Fatal(anyhow!(
                 "at least one partition_key column must be defined in TopicInfo"
-            ));
+            )));
         }
 
         let schema = client
@@ -255,8 +254,8 @@ pub async fn publication_info(
             .map(|row| {
                 let name: String = row.get("name");
                 let oid = row.get("oid");
-                let pg_type =
-                    PgType::from_oid(oid).ok_or_else(|| anyhow!("unknown type OID: {}", oid))?;
+                let pg_type = PgType::from_oid(oid)
+                    .ok_or_else(|| ReplicationError::Fatal(anyhow!("unknown type OID: {}", oid)))?;
                 let not_null: bool = row.get("not_null");
                 let nullable = !not_null;
                 let primary_key = row.get("primary_key");
@@ -265,9 +264,9 @@ pub async fn publication_info(
                 // if the column is declared a partition_key column, but is nullable
                 // it is invalid
                 if partition_key && nullable {
-                    return Err(anyhow!(
+                    return Err(ReplicationError::Fatal(anyhow!(
                         "column is declared a partition_key, but is also declared as nullable"
-                    ));
+                    )));
                 }
 
                 Ok(Column {
@@ -278,7 +277,7 @@ pub async fn publication_info(
                     partition_key,
                 })
             })
-            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+            .collect::<Result<Vec<_>, ReplicationError>>()?;
 
         // we must validate the partition_key columns of schema such that there
         // are exactly as many partition_key columns as are defined in TopicInfo
@@ -289,7 +288,7 @@ pub async fn publication_info(
                 .collect::<Vec<_>>()
                 .len()
         {
-            return Err(anyhow!("at least one column defined as a partition key in TopicInfo does not exist on the table"));
+            return Err(ReplicationError::Fatal(anyhow!("at least one column defined as a partition key in TopicInfo does not exist on the table")));
         }
 
         table_infos.insert(

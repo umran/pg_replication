@@ -1,23 +1,18 @@
-use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
 use rdkafka::error::KafkaError;
-use rdkafka::message::Header;
-use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::BaseRecord;
 use rdkafka::producer::ProducerContext;
 use rdkafka::producer::ThreadedProducer;
 use rdkafka::types::RDKafkaErrorCode;
 use rdkafka::ClientConfig;
 use rdkafka::ClientContext;
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
-
-use crate::util::TableInfo;
-use crate::Op;
-use crate::ReplicationOp;
 
 #[derive(Clone)]
 pub struct KafkaProducer {
@@ -29,10 +24,17 @@ struct KafkaProducerContext {
     committed_lsn_tx: Sender<u64>,
 }
 
+pub struct KafkaProducerMessage<T> {
+    pub topic: String,
+    pub partition_key: String,
+    pub prev_lsn: u64,
+    pub payload: T,
+}
+
 impl ClientContext for KafkaProducerContext {}
 
 impl ProducerContext for KafkaProducerContext {
-    type DeliveryOpaque = Box<ReplicationOp>;
+    type DeliveryOpaque = Box<u64>;
 
     fn delivery(
         &self,
@@ -41,7 +43,7 @@ impl ProducerContext for KafkaProducerContext {
     ) {
         if let Ok(_) = delivery_result {
             self.committed_lsn_tx
-                .blocking_send(delivery_opaque.prev_lsn)
+                .blocking_send(*delivery_opaque)
                 .unwrap();
         }
     }
@@ -52,12 +54,14 @@ impl KafkaProducer {
         Self { brokers }
     }
 
-    pub fn produce(
-        &self,
-        publication_tables: HashMap<u32, TableInfo>,
-    ) -> (Sender<ReplicationOp>, Receiver<u64>) {
-        let (msg_tx, mut msg_rx): (Sender<ReplicationOp>, Receiver<ReplicationOp>) =
-            mpsc::channel(1);
+    pub fn produce<T>(&self) -> (Sender<KafkaProducerMessage<T>>, Receiver<u64>)
+    where
+        T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        let (msg_tx, mut msg_rx): (
+            Sender<KafkaProducerMessage<T>>,
+            Receiver<KafkaProducerMessage<T>>,
+        ) = mpsc::channel(1);
 
         let (committed_lsn_tx, committed_lsn_rx) = mpsc::channel(1);
 
@@ -71,31 +75,10 @@ impl KafkaProducer {
 
         tokio::task::spawn_blocking(move || {
             while let Some(msg) = msg_rx.blocking_recv() {
-                let table_info = publication_tables
-                    .get(&msg.rel_id)
-                    .expect("table with requested oid not present in publication");
+                let payload = serde_json::to_string(&msg.payload).unwrap();
 
-                let topic_name = &table_info.topic;
-
-                let partition_key = match &msg.op {
-                    Op::Insert(row) => table_info.extract_partition_key(row).unwrap(),
-                    Op::Update((row, _)) => table_info.extract_partition_key(row).unwrap(),
-                    Op::Delete(row) => table_info.extract_partition_key(row).unwrap(),
-                }
-                .join("");
-
-                let idempotency_key = format!("{}-{}", msg.lsn, msg.seq_id);
-
-                let headers = OwnedHeaders::new().insert(Header {
-                    key: "idempotency_key",
-                    value: Some(idempotency_key.as_bytes()),
-                });
-
-                let payload = serde_json::to_string(&msg.op).unwrap();
-
-                let mut record = BaseRecord::with_opaque_to(topic_name.as_str(), Box::new(msg))
-                    .key(&partition_key)
-                    .headers(headers)
+                let mut record = BaseRecord::with_opaque_to(&msg.topic, Box::new(msg.prev_lsn))
+                    .key(&msg.partition_key)
                     .payload(&payload);
 
                 loop {
@@ -107,7 +90,7 @@ impl KafkaProducer {
                             thread::sleep(Duration::from_millis(500));
                         }
                         Err((e, _)) => {
-                            panic!("Failed to publish on kafka {:?}", e);
+                            panic!("Failed to publish to kafka {:?}", e);
                         }
                     }
                 }
