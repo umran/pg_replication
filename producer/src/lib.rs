@@ -463,7 +463,7 @@ fn message_from_op(
     seq_id: u64,
     op: Op,
     publication_tables: &HashMap<u32, TableInfo>,
-) -> Result<KafkaProducerMessage<ReplicationOp>, ReplicationError> {
+) -> Result<KafkaProducerMessage, ReplicationError> {
     let table_info = try_fatal!(publication_tables.get(&rel_id).ok_or_else(|| anyhow!(
         "table info for the received rel_id does not exisit in publication"
     )));
@@ -477,15 +477,23 @@ fn message_from_op(
     })
     .join("");
 
+    let payload = ReplicationOp {
+        rel_id,
+        lsn,
+        seq_id,
+        op,
+    };
+
+    let payload = serde_json::to_string(&payload).map_err(|_| {
+        ReplicationError::Fatal(anyhow!(
+            "failed to serialize op! this should be unreachable!"
+        ))
+    })?;
+
     Ok(KafkaProducerMessage {
         topic,
         partition_key,
         prev_lsn,
-        payload: ReplicationOp {
-            rel_id,
-            lsn,
-            seq_id,
-            op,
-        },
+        payload,
     })
 }
