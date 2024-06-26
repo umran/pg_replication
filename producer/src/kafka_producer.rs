@@ -102,6 +102,8 @@ impl KafkaProducer {
                                 e
                             );
 
+                            // TODO(umran): find a way to make the main function exit with a recoverable error
+                            // panicking here only kills the spawned task and doesn't kill the main function.
                             panic!("Failed to enqueue message with potentially fatal error!")
                         }
                     }
