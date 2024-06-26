@@ -46,7 +46,8 @@ impl ProducerContext for KafkaProducerContext {
         if let Ok(_) = delivery_result {
             // it's safe to unwrap here because it will only panic if called in an async
             // context (which we're not) or if the receiver has been dropped. If the receiver is dropped
-            // it means the main task has exited so it doesn't matter if we panic here
+            // it means the main task has exited and all spawned tasks will get cleaned up by tokio,
+            // so it doesn't matter if we panic here
             self.committed_lsn_tx
                 .blocking_send(*delivery_opaque)
                 .unwrap();
@@ -105,8 +106,11 @@ impl KafkaProducer {
                                 e
                             );
 
-                            // TODO(umran): find a way to make the main function exit with a recoverable error
-                            // panicking here only kills the spawned task and doesn't kill the main function.
+                            // panicking here will cause the current task to exit, causing
+                            // the receiver end of the message channel to be dropped,
+                            // causing future sends to the message channel from the main task to fail
+                            // at which point a recoverable error will be emitted, which will cause
+                            // the programme to restart
                             panic!("Failed to enqueue message with potentially fatal error!")
                         }
                     }
