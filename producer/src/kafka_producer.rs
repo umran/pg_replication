@@ -8,8 +8,6 @@ use rdkafka::producer::ThreadedProducer;
 use rdkafka::types::RDKafkaErrorCode;
 use rdkafka::ClientConfig;
 use rdkafka::ClientContext;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
@@ -26,11 +24,11 @@ struct KafkaProducerContext {
     committed_lsn_tx: Sender<u64>,
 }
 
-pub struct KafkaProducerMessage<T> {
+pub struct KafkaProducerMessage {
     pub topic: String,
     pub partition_key: String,
     pub prev_lsn: u64,
-    pub payload: T,
+    pub payload: String,
 }
 
 impl ClientContext for KafkaProducerContext {}
@@ -44,13 +42,10 @@ impl ProducerContext for KafkaProducerContext {
         delivery_opaque: Self::DeliveryOpaque,
     ) {
         if let Ok(_) = delivery_result {
-            // it's safe to unwrap here because it will only panic if called in an async
-            // context (which we're not) or if the receiver has been dropped. If the receiver is dropped
-            // it means the main task has exited and all spawned tasks will get cleaned up by tokio,
-            // so it doesn't matter if we panic here
-            self.committed_lsn_tx
-                .blocking_send(*delivery_opaque)
-                .unwrap();
+            // We don't care if the send fails here as it can only fail if the receiver has been dropped.
+            // If the receiver has beend dropped it means the main task has exited and all spawned tasks
+            // will get cleaned up by tokio
+            self.committed_lsn_tx.blocking_send(*delivery_opaque);
         }
     }
 }
@@ -60,16 +55,11 @@ impl KafkaProducer {
         Self { brokers }
     }
 
-    pub fn produce<T>(
+    pub fn produce(
         &self,
-    ) -> Result<(Sender<KafkaProducerMessage<T>>, Receiver<u64>), ReplicationError>
-    where
-        T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
-    {
-        let (msg_tx, mut msg_rx): (
-            Sender<KafkaProducerMessage<T>>,
-            Receiver<KafkaProducerMessage<T>>,
-        ) = mpsc::channel(1);
+    ) -> Result<(Sender<KafkaProducerMessage>, Receiver<u64>), ReplicationError> {
+        let (msg_tx, mut msg_rx): (Sender<KafkaProducerMessage>, Receiver<KafkaProducerMessage>) =
+            mpsc::channel(1);
 
         let (committed_lsn_tx, committed_lsn_rx) = mpsc::channel(1);
 
@@ -85,11 +75,9 @@ impl KafkaProducer {
 
         tokio::task::spawn_blocking(move || {
             while let Some(msg) = msg_rx.blocking_recv() {
-                let payload = serde_json::to_string(&msg.payload).unwrap();
-
                 let mut record = BaseRecord::with_opaque_to(&msg.topic, Box::new(msg.prev_lsn))
                     .key(&msg.partition_key)
-                    .payload(&payload);
+                    .payload(&msg.payload);
 
                 loop {
                     match producer.send(record) {
@@ -106,12 +94,12 @@ impl KafkaProducer {
                                 e
                             );
 
-                            // panicking here will cause the current task to exit, causing
+                            // breaking here will cause the current task to exit, causing
                             // the receiver end of the message channel to be dropped,
                             // causing future sends to the message channel from the main task to fail
                             // at which point a recoverable error will be emitted, which will cause
                             // the programme to restart
-                            panic!("Failed to enqueue message with potentially fatal error!")
+                            break;
                         }
                     }
                 }
