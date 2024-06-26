@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail};
-use async_trait::async_trait;
 use futures::TryStreamExt;
 use lazy_static::lazy_static;
 
@@ -15,13 +14,13 @@ use postgres_protocol::message::backend::{
     LogicalReplicationMessage, ReplicationMessage, TupleData,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
 use tokio_postgres::replication::LogicalReplicationStream;
+use tokio_postgres::SimpleQueryMessage;
 
 use error::ReplicationError;
-use tokio_postgres::SimpleQueryMessage;
-use util::TableInfo;
+use kafka_producer::KafkaProducer;
+use util::TopicInfo;
 
 lazy_static! {
     /// Postgres epoch is 2000-01-01T00:00:00Z
@@ -47,10 +46,12 @@ macro_rules! try_recoverable {
 }
 
 /// Information required to sync data from Postgres
-pub struct Replication {
+pub struct Producer {
     connection_string: String,
+    kafka_brokers: String,
     slot_name: String,
     publication_name: String,
+    topic_map: HashMap<String, TopicInfo>,
     consistent_point: Arc<RwLock<u64>>,
 }
 
@@ -71,22 +72,43 @@ pub enum Op {
 
 pub type Row = Vec<Option<String>>;
 
-#[async_trait]
-pub trait ReplicationProducer {
-    fn produce(
-        &self,
-        publication_tables: HashMap<u32, TableInfo>,
-    ) -> (Sender<ReplicationOp>, Receiver<u64>);
-}
-
-impl Replication {
+impl Producer {
     /// Constructs a new instance
-    pub fn new(connection_string: String, slot_name: String, publication_name: String) -> Self {
+    pub fn new(
+        connection_string: String,
+        kafka_brokers: String,
+        slot_name: String,
+        publication_name: String,
+        topic_map: HashMap<String, TopicInfo>,
+    ) -> Self {
         Self {
             connection_string,
+            kafka_brokers,
             slot_name,
             publication_name,
+            topic_map,
             consistent_point: Arc::new(RwLock::new(0)),
+        }
+    }
+
+    pub async fn start(&mut self) -> Result<(), ReplicationError> {
+        self.create_slot().await?;
+
+        loop {
+            match self.start_replication().await {
+                Err(ReplicationError::Recoverable(e)) => {
+                    tracing::warn!(
+                        "replication for slot {} interrupted, retrying: {}",
+                        &self.slot_name,
+                        e
+                    )
+                }
+                Err(ReplicationError::Fatal(e)) => return Err(ReplicationError::Fatal(e)),
+                Ok(_) => unreachable!("replication stream cannot exit without an error"),
+            }
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            tracing::info!("resuming replication for slot {}", &self.slot_name);
         }
     }
 
@@ -190,21 +212,20 @@ impl Replication {
         Ok(())
     }
 
-    async fn start_replication<T>(
-        &mut self,
-        replication_producer: T,
-    ) -> Result<(), ReplicationError>
-    where
-        T: ReplicationProducer + Send + 'static,
-    {
+    async fn start_replication(&mut self) -> Result<(), ReplicationError> {
         use ReplicationError::*;
 
         let publication_tables = try_recoverable!(
-            util::publication_info(&self.connection_string, &self.publication_name).await
+            util::publication_info(
+                &self.connection_string,
+                &self.publication_name,
+                &self.topic_map
+            )
+            .await
         );
 
-        let (replication_op_tx, mut committed_lsn_rx) =
-            replication_producer.produce(publication_tables);
+        let kafka_producer = KafkaProducer::new(self.kafka_brokers.clone());
+        let (replication_op_tx, mut committed_lsn_rx) = kafka_producer.produce(publication_tables);
 
         let consistent_point = self.consistent_point.clone();
 
@@ -395,32 +416,6 @@ impl Replication {
         }
 
         Err(Recoverable(anyhow!("replication stream ended")))
-    }
-}
-
-impl Replication {
-    pub async fn start<T>(&mut self, replication_producer: T) -> Result<(), ReplicationError>
-    where
-        T: ReplicationProducer + Clone + Send + 'static,
-    {
-        self.create_slot().await?;
-
-        loop {
-            match self.start_replication(replication_producer.clone()).await {
-                Err(ReplicationError::Recoverable(e)) => {
-                    tracing::warn!(
-                        "replication for slot {} interrupted, retrying: {}",
-                        &self.slot_name,
-                        e
-                    )
-                }
-                Err(ReplicationError::Fatal(e)) => return Err(ReplicationError::Fatal(e)),
-                Ok(_) => unreachable!("replication stream cannot exit without an error"),
-            }
-
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            tracing::info!("resuming replication for slot {}", &self.slot_name);
-        }
     }
 }
 

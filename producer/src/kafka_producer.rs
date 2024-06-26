@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use rdkafka::error::KafkaError;
 use rdkafka::message::Header;
 use rdkafka::message::OwnedHeaders;
@@ -16,11 +15,9 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 
-use crate::error::ReplicationError;
 use crate::util::TableInfo;
 use crate::Op;
 use crate::ReplicationOp;
-use crate::ReplicationProducer;
 
 #[derive(Clone)]
 pub struct KafkaProducer {
@@ -51,16 +48,11 @@ impl ProducerContext for KafkaProducerContext {
 }
 
 impl KafkaProducer {
-    pub async fn new(brokers: &str) -> Result<Self, ReplicationError> {
-        Ok(Self {
-            brokers: brokers.into(),
-        })
+    pub fn new(brokers: String) -> Self {
+        Self { brokers }
     }
-}
 
-#[async_trait]
-impl ReplicationProducer for KafkaProducer {
-    fn produce(
+    pub fn produce(
         &self,
         publication_tables: HashMap<u32, TableInfo>,
     ) -> (Sender<ReplicationOp>, Receiver<u64>) {
@@ -83,12 +75,12 @@ impl ReplicationProducer for KafkaProducer {
                     .get(&msg.rel_id)
                     .expect("table with requested oid not present in publication");
 
-                let topic_name = format!("{}.{}", table_info.namespace, table_info.name);
+                let topic_name = &table_info.topic;
 
-                let primary_key = match &msg.op {
-                    Op::Insert(row) => table_info.extract_primary_key(row).unwrap(),
-                    Op::Update((row, _)) => table_info.extract_primary_key(row).unwrap(),
-                    Op::Delete(row) => table_info.extract_primary_key(row).unwrap(),
+                let partition_key = match &msg.op {
+                    Op::Insert(row) => table_info.extract_partition_key(row).unwrap(),
+                    Op::Update((row, _)) => table_info.extract_partition_key(row).unwrap(),
+                    Op::Delete(row) => table_info.extract_partition_key(row).unwrap(),
                 }
                 .join("");
 
@@ -102,7 +94,7 @@ impl ReplicationProducer for KafkaProducer {
                 let payload = serde_json::to_string(&msg.op).unwrap();
 
                 let mut record = BaseRecord::with_opaque_to(topic_name.as_str(), Box::new(msg))
-                    .key(&primary_key)
+                    .key(&partition_key)
                     .headers(headers)
                     .payload(&payload);
 

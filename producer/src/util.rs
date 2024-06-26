@@ -3,18 +3,17 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode};
 use postgres_openssl::MakeTlsConnector;
+use serde::{Deserialize, Serialize};
 use tokio_postgres::config::{ReplicationMode, SslMode};
 use tokio_postgres::types::Type as PgType;
 use tokio_postgres::{Client, Config};
 
 mod task;
 
-/// Information about a table column
-pub struct PgColumn {
+#[derive(Serialize, Deserialize)]
+pub struct TopicInfo {
     pub name: String,
-    pub type_: PgType,
-    pub nullable: bool,
-    pub primary_key: bool,
+    pub partition_key: Vec<String>,
 }
 
 /// Information about a remote table
@@ -25,38 +24,79 @@ pub struct TableInfo {
     pub namespace: String,
     /// The name of the table
     pub name: String,
+    /// The topic to publish this table to
+    pub topic: String,
     /// The schema of each column, in order
-    pub schema: Vec<PgColumn>,
+    pub schema: Vec<Column>,
+}
+
+/// Information about a table column
+pub struct Column {
+    pub name: String,
+    pub pg_type: PgType,
+    pub nullable: bool,
+    pub primary_key: bool,
+    /// Indicates whether this column is part of the partition_key used when publishing to Kafka
+    pub partition_key: bool,
 }
 
 impl TableInfo {
-    pub fn extract_primary_key(
+    // pub fn extract_primary_key(
+    //     &self,
+    //     row: &Vec<Option<String>>,
+    // ) -> Result<Vec<String>, anyhow::Error> {
+    //     let primary_key_indices = self
+    //         .schema
+    //         .iter()
+    //         .enumerate()
+    //         .filter_map(|(i, col)| if col.primary_key { Some(i) } else { None })
+    //         .collect::<Vec<_>>();
+
+    //     let mut primary_key = vec![];
+
+    //     for i in primary_key_indices.into_iter() {
+    //         let value = row.get(i).ok_or_else(|| {
+    //             anyhow!("row does not have primary key index as defined in schema")
+    //         })?;
+    //         let value = value.clone().ok_or_else(|| {
+    //             anyhow!(
+    //                 "a primary key column of the row (according to the schema) happens to be null"
+    //             )
+    //         })?;
+
+    //         primary_key.push(value);
+    //     }
+
+    //     Ok(primary_key)
+    // }
+
+    pub fn extract_partition_key(
         &self,
         row: &Vec<Option<String>>,
     ) -> Result<Vec<String>, anyhow::Error> {
-        let primary_key_indices = self
+        let partition_key_indices = self
             .schema
             .iter()
             .enumerate()
-            .filter_map(|(i, col)| if col.primary_key { Some(i) } else { None })
+            .filter_map(|(i, col)| if col.partition_key { Some(i) } else { None })
             .collect::<Vec<_>>();
 
-        let mut primary_key = vec![];
+        let mut partition_key = vec![];
 
-        for i in primary_key_indices.into_iter() {
+        for i in partition_key_indices.into_iter() {
             let value = row.get(i).ok_or_else(|| {
-                anyhow!("row does not have primary key index as defined in schema")
+                anyhow!("row does not have partition key index as defined in schema")
             })?;
             let value = value.clone().ok_or_else(|| {
                 anyhow!(
-                    "a primary key column of the row (according to the schema) happens to be null"
+                    "a partition key column of the row (according to the schema) happens to be null"
                 )
             })?;
 
-            primary_key.push(value);
+            partition_key.push(value);
         }
 
-        Ok(primary_key)
+        Ok(partition_key)
     }
 }
 
@@ -140,6 +180,7 @@ pub async fn connect_replication(conn: &str) -> Result<Client, anyhow::Error> {
 pub async fn publication_info(
     conn: &str,
     publication: &str,
+    topic_map: &HashMap<String, TopicInfo>,
 ) -> Result<HashMap<u32, TableInfo>, anyhow::Error> {
     let config = conn.parse()?;
     let tls = make_tls(&config)?;
@@ -174,6 +215,22 @@ pub async fn publication_info(
     for row in tables {
         let rel_id = row.get("oid");
 
+        let namespace = row.get("schemaname");
+        let name = row.get("tablename");
+
+        let topic_info = topic_map
+            .get(&name)
+            .ok_or_else(|| anyhow!("TopicInfo missing for table"))?;
+
+        // check that there is at least one partition_key column defined in TopicInfo
+        // 1-1 correspondence between columns defined in TopicInfo and the table schema
+        // is checked below
+        if topic_info.partition_key.len() == 0 {
+            return Err(anyhow!(
+                "at least one partition_key column must be defined in TopicInfo"
+            ));
+        }
+
         let schema = client
             .query(
                 "SELECT
@@ -201,23 +258,48 @@ pub async fn publication_info(
                 let pg_type =
                     PgType::from_oid(oid).ok_or_else(|| anyhow!("unknown type OID: {}", oid))?;
                 let not_null: bool = row.get("not_null");
+                let nullable = !not_null;
                 let primary_key = row.get("primary_key");
-                Ok(PgColumn {
+                let partition_key = topic_info.partition_key.contains(&name);
+
+                // if the column is declared a partition_key column, but is nullable
+                // it is invalid
+                if partition_key && nullable {
+                    return Err(anyhow!(
+                        "column is declared a partition_key, but is also declared as nullable"
+                    ));
+                }
+
+                Ok(Column {
                     name,
-                    type_: pg_type,
-                    nullable: !not_null,
+                    pg_type,
+                    nullable,
                     primary_key,
+                    partition_key,
                 })
             })
             .collect::<Result<Vec<_>, anyhow::Error>>()?;
+
+        // we must validate the partition_key columns of schema such that there
+        // are exactly as many partition_key columns as are defined in TopicInfo
+        if topic_info.partition_key.len()
+            != schema
+                .iter()
+                .filter(|col| col.partition_key)
+                .collect::<Vec<_>>()
+                .len()
+        {
+            return Err(anyhow!("at least one column defined as a partition key in TopicInfo does not exist on the table"));
+        }
 
         table_infos.insert(
             rel_id,
             TableInfo {
                 rel_id,
-                namespace: row.get("schemaname"),
-                name: row.get("tablename"),
+                namespace,
+                name,
                 schema,
+                topic: topic_info.name.clone(),
             },
         );
     }
