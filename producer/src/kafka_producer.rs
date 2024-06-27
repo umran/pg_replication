@@ -44,6 +44,11 @@ impl ProducerContext for KafkaProducerContext {
     ) {
         match delivery_result {
             Ok(_) => {
+                tracing::info!(
+                    "message with committed_lsn = {} was successfully delivered",
+                    *delivery_opaque
+                );
+
                 // We don't care if the send fails here as it can only fail if the receiver has been dropped.
                 // If the receiver has been dropped it means the main task has exited and all spawned tasks
                 // will get cleaned up by tokio

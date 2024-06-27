@@ -144,18 +144,16 @@ impl Producer {
         tokio::spawn(async move {
             while let Some(committed_lsn) = committed_lsn_rx.recv().await {
                 if committed_lsn > *confirmed_flush_lsn_clone.read().await {
+                    tracing::info!("setting confirmed_flush_lsn to {}", committed_lsn);
+
                     let mut confirmed_flush_lsn = confirmed_flush_lsn_clone.write().await;
                     *confirmed_flush_lsn = committed_lsn
                 }
             }
         });
 
-        tracing::info!("attempting to kill any active pid");
-
         // kill any active pid that is already bound to the slot before attempting to start replication
         kill_active_pid(&metadata_client, slot_meta_data.active_pid).await;
-
-        tracing::info!("attempting to start replication");
 
         let lsn: PgLsn = (*confirmed_flush_lsn.read().await).into();
         let query = format!(
@@ -163,8 +161,6 @@ impl Producer {
             &self.slot_name, lsn, self.publication_name
         );
         let copy_stream = try_recoverable!(replication_client.copy_both_simple(&query).await);
-
-        tracing::info!("copy both simple complete. stream created");
 
         let stream = LogicalReplicationStream::new(copy_stream);
         tokio::pin!(stream);
@@ -203,6 +199,11 @@ impl Producer {
                         .as_mut()
                         .standby_status_update(lsn, lsn, lsn, ts, 0)
                         .await
+                );
+
+                tracing::info!(
+                    "keepalive sent successfully with confirmed_flush_lsn = {}",
+                    lsn
                 );
 
                 last_keepalive = Instant::now();
@@ -341,9 +342,7 @@ impl Producer {
                     }
                 }
                 // Handled above
-                PrimaryKeepAlive(_) => {
-                    tracing::info!("keepalive message received and handled")
-                }
+                PrimaryKeepAlive(_) => {}
                 // The enum is marked non_exaustive, better be conservative
                 _ => {
                     return Err(ReplicationError::Fatal(anyhow!(
