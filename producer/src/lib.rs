@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail};
+use anyhow::anyhow;
 use futures::TryStreamExt;
 use lazy_static::lazy_static;
 
@@ -460,11 +460,13 @@ where
     for val in tuple_data.into_iter() {
         let datum = match val {
             TupleData::Null => None,
-            TupleData::UnchangedToast => bail!(
-                "Missing TOASTed value from table with OID = {}. \
-                Did you forget to set REPLICA IDENTITY to FULL for your table?",
-                rel_id
-            ),
+            TupleData::UnchangedToast => {
+                return Err(anyhow!(
+                    "Missing TOASTed value from table with OID = {}. \
+                    Did you forget to set REPLICA IDENTITY to FULL for your table?",
+                    rel_id
+                ))
+            }
             TupleData::Text(b) => std::str::from_utf8(&b)?.to_string().into(),
         };
 
