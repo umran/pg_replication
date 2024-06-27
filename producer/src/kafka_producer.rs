@@ -24,6 +24,7 @@ struct KafkaProducerContext {
     committed_lsn_tx: Sender<u64>,
 }
 
+#[derive(Debug)]
 pub struct KafkaProducerMessage {
     pub topic: String,
     pub partition_key: String,
@@ -46,6 +47,15 @@ impl ProducerContext for KafkaProducerContext {
             // If the receiver has beend dropped it means the main task has exited and all spawned tasks
             // will get cleaned up by tokio
             let _ = self.committed_lsn_tx.blocking_send(*delivery_opaque);
+        }
+
+        if let Err((err, _)) = delivery_result {
+            tracing::warn!(
+                "message delivery failed for message bearing committed_lsn = {}",
+                *delivery_opaque
+            );
+
+            tracing::error!("{:?}", err)
         }
     }
 }
@@ -75,6 +85,9 @@ impl KafkaProducer {
 
         tokio::task::spawn_blocking(move || {
             while let Some(msg) = msg_rx.blocking_recv() {
+                tracing::info!("received a message to produce to kafka");
+                tracing::info!("{:?}", msg);
+
                 let mut record = BaseRecord::with_opaque_to(&msg.topic, Box::new(msg.prev_lsn))
                     .key(&msg.partition_key)
                     .payload(&msg.payload);

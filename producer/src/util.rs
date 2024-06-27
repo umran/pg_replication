@@ -19,6 +19,7 @@ pub struct TopicInfo {
 }
 
 /// Information about a remote table
+#[derive(Debug)]
 pub struct TableInfo {
     /// The OID of the table
     pub rel_id: u32,
@@ -33,6 +34,7 @@ pub struct TableInfo {
 }
 
 /// Information about a table column
+#[derive(Debug)]
 pub struct Column {
     pub name: String,
     pub pg_type: PgType,
@@ -43,35 +45,6 @@ pub struct Column {
 }
 
 impl TableInfo {
-    // pub fn extract_primary_key(
-    //     &self,
-    //     row: &Vec<Option<String>>,
-    // ) -> Result<Vec<String>, anyhow::Error> {
-    //     let primary_key_indices = self
-    //         .schema
-    //         .iter()
-    //         .enumerate()
-    //         .filter_map(|(i, col)| if col.primary_key { Some(i) } else { None })
-    //         .collect::<Vec<_>>();
-
-    //     let mut primary_key = vec![];
-
-    //     for i in primary_key_indices.into_iter() {
-    //         let value = row.get(i).ok_or_else(|| {
-    //             anyhow!("row does not have primary key index as defined in schema")
-    //         })?;
-    //         let value = value.clone().ok_or_else(|| {
-    //             anyhow!(
-    //                 "a primary key column of the row (according to the schema) happens to be null"
-    //             )
-    //         })?;
-
-    //         primary_key.push(value);
-    //     }
-
-    //     Ok(primary_key)
-    // }
-
     pub fn extract_partition_key(
         &self,
         row: &Vec<Option<String>>,
@@ -155,21 +128,6 @@ fn make_tls(config: &Config) -> Result<MakeTlsConnector, anyhow::Error> {
     }
 
     Ok(tls_connector)
-}
-
-/// Starts a replication connection to the upstream database
-pub async fn connect_replication(conn: &str) -> Result<Client, anyhow::Error> {
-    let mut config: Config = conn.parse()?;
-    let tls = make_tls(&config)?;
-    let (client, connection) = config
-        .replication_mode(ReplicationMode::Logical)
-        .connect(tls)
-        .await?;
-    task::spawn(
-        || format!("postgres_connect_replication:{conn}"),
-        connection,
-    );
-    Ok(client)
 }
 
 /// Fetches table schema information from an upstream Postgres source for all tables that are part
@@ -304,4 +262,30 @@ pub async fn publication_info(
     }
 
     Ok(table_infos)
+}
+
+/// Starts a replication connection to the upstream database
+pub async fn connect_replication(conn: &str) -> Result<Client, anyhow::Error> {
+    let mut config: Config = conn.parse()?;
+    let tls = make_tls(&config)?;
+    let (client, connection) = config
+        .replication_mode(ReplicationMode::Logical)
+        .connect(tls)
+        .await?;
+    task::spawn(
+        || format!("postgres_connect_replication:{conn}"),
+        connection,
+    );
+    Ok(client)
+}
+
+/// Starts a replication connection to the upstream database
+pub async fn connect_basic(conn: &str) -> Result<Client, anyhow::Error> {
+    let config: Config = conn.parse()?;
+    let tls = make_tls(&config)?;
+
+    let (client, connection) = tokio_postgres::connect(conn, tls).await?;
+    task::spawn(|| format!("postgres_connect_basic:{conn}"), connection);
+
+    Ok(client)
 }

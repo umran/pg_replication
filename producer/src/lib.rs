@@ -22,7 +22,8 @@ use tokio_postgres::Client;
 
 use error::ReplicationError;
 use kafka_producer::{KafkaProducer, KafkaProducerMessage};
-use util::{TableInfo, TopicInfo};
+use util::TableInfo;
+pub use util::TopicInfo;
 
 lazy_static! {
     /// Postgres epoch is 2000-01-01T00:00:00Z
@@ -73,6 +74,7 @@ pub enum Op {
 
 pub type Row = Vec<Option<String>>;
 
+#[derive(Debug)]
 struct SlotMetadata {
     confirmed_flush_lsn: u64,
     active_pid: Option<i32>,
@@ -96,7 +98,7 @@ impl Producer {
         }
     }
 
-    pub async fn start(&mut self) -> Result<(), anyhow::Error> {
+    pub async fn start(&self) -> Result<(), anyhow::Error> {
         loop {
             match self.start_replication().await {
                 Err(ReplicationError::Recoverable(e)) => {
@@ -115,16 +117,23 @@ impl Producer {
         }
     }
 
-    async fn start_replication(&mut self) -> Result<(), ReplicationError> {
-        let client = try_recoverable!(util::connect_replication(&self.connection_string).await);
+    async fn start_replication(&self) -> Result<(), ReplicationError> {
+        let metadata_client = try_recoverable!(util::connect_basic(&self.connection_string).await);
+        let replication_client =
+            try_recoverable!(util::connect_replication(&self.connection_string).await);
 
-        ensure_replication_slot(&client, &self.slot_name).await?;
+        ensure_replication_slot(&replication_client, &self.slot_name).await?;
 
         let slot_meta_data =
-            fetch_slot_metadata(&client, &self.slot_name, Duration::from_secs(3)).await?;
+            fetch_slot_metadata(&metadata_client, &self.slot_name, Duration::from_secs(3)).await?;
+
+        tracing::info!("slot metadata: {:?}", slot_meta_data);
 
         let publication_tables =
-            util::publication_info(&client, &self.publication_name, &self.topic_map).await?;
+            util::publication_info(&metadata_client, &self.publication_name, &self.topic_map)
+                .await?;
+
+        tracing::info!("publication tables: {:?}", publication_tables);
 
         let kafka_producer = KafkaProducer::new(self.kafka_brokers.clone());
         let (msg_tx, mut committed_lsn_rx) = kafka_producer.produce()?;
@@ -141,17 +150,21 @@ impl Producer {
             }
         });
 
-        // kill any active pid that is already bound to the slot before attempting to start replication
-        kill_active_pid(&client, slot_meta_data.active_pid).await;
+        tracing::info!("attempting to kill any active pid");
 
+        // kill any active pid that is already bound to the slot before attempting to start replication
+        kill_active_pid(&metadata_client, slot_meta_data.active_pid).await;
+
+        tracing::info!("attempting to start replication");
+
+        let lsn: PgLsn = (*confirmed_flush_lsn.read().await).into();
         let query = format!(
-            r#"START_REPLICATION SLOT "{name}" LOGICAL {lsn}
-            ("proto_version" '1', "publication_names" '{publication}')"#,
-            name = &self.slot_name,
-            lsn = *confirmed_flush_lsn.read().await,
-            publication = self.publication_name
+            r#"START_REPLICATION SLOT "{}" LOGICAL {} ("proto_version" '1', "publication_names" '{}')"#,
+            &self.slot_name, lsn, self.publication_name
         );
-        let copy_stream = try_recoverable!(client.copy_both_simple(&query).await);
+        let copy_stream = try_recoverable!(replication_client.copy_both_simple(&query).await);
+
+        tracing::info!("copy both simple complete. stream created");
 
         let stream = LogicalReplicationStream::new(copy_stream);
         tokio::pin!(stream);
@@ -200,6 +213,8 @@ impl Producer {
                     use LogicalReplicationMessage::*;
                     match xlog_data.data() {
                         Begin(begin) => {
+                            tracing::info!("received BEGIN message");
+
                             if tx_in_progress {
                                 return Err(ReplicationError::Fatal(anyhow!("received a begin before commit for the previous transaction! this is a bug!")));
                             }
@@ -210,6 +225,8 @@ impl Producer {
                             lsn = begin.final_lsn();
                         }
                         Insert(insert) => {
+                            tracing::info!("received INSERT message");
+
                             let rel_id = insert.rel_id();
                             let new_tuple = insert.tuple().tuple_data();
                             let row = try_fatal!(row_from_tuple_data(rel_id, new_tuple));
@@ -231,6 +248,8 @@ impl Producer {
                             seq_id += 1;
                         }
                         Update(update) => {
+                            tracing::info!("received UPDATE message");
+
                             let rel_id = update.rel_id();
 
                             let old_tuple = try_fatal!(update
@@ -271,6 +290,8 @@ impl Producer {
                             seq_id += 1;
                         }
                         Delete(delete) => {
+                            tracing::info!("received DELETE message");
+
                             let rel_id = delete.rel_id();
 
                             let old_tuple = try_fatal!(delete
@@ -298,6 +319,8 @@ impl Producer {
                             seq_id += 1;
                         }
                         Commit(_) => {
+                            tracing::info!("received COMMIT message");
+
                             tx_in_progress = false;
                         }
                         Origin(_) | Relation(_) | Type(_) => {
@@ -318,7 +341,9 @@ impl Producer {
                     }
                 }
                 // Handled above
-                PrimaryKeepAlive(_) => {}
+                PrimaryKeepAlive(_) => {
+                    tracing::info!("keepalive message received and handled")
+                }
                 // The enum is marked non_exaustive, better be conservative
                 _ => {
                     return Err(ReplicationError::Fatal(anyhow!(
@@ -335,18 +360,21 @@ impl Producer {
 }
 
 async fn ensure_replication_slot(client: &Client, slot: &str) -> Result<(), ReplicationError> {
-    match client
-        .execute(
-            "CREATE_REPLICATION_SLOT $1 LOGICAL \"pgoutput\" NOEXPORT_SNAPSHOT",
-            &[&slot],
-        )
-        .await
-    {
+    let slot_query = format!(
+        r#"CREATE_REPLICATION_SLOT "{}" LOGICAL "pgoutput" NOEXPORT_SNAPSHOT"#,
+        slot
+    );
+
+    match client.simple_query(&slot_query).await {
         Ok(_) => Ok(()),
         Err(err) if err.code() == Some(&SqlState::DUPLICATE_OBJECT) => Ok(()),
-        Err(_) => Err(ReplicationError::Recoverable(anyhow!(
-            "transient postgres error"
-        ))),
+        Err(err) => {
+            tracing::warn!("{}", err);
+
+            return Err(ReplicationError::Recoverable(anyhow!(
+                "transient postgres error"
+            )));
+        }
     }
 }
 
