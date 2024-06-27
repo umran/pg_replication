@@ -42,20 +42,20 @@ impl ProducerContext for KafkaProducerContext {
         delivery_result: &rdkafka::message::DeliveryResult<'_>,
         delivery_opaque: Self::DeliveryOpaque,
     ) {
-        if let Ok(_) = delivery_result {
-            // We don't care if the send fails here as it can only fail if the receiver has been dropped.
-            // If the receiver has beend dropped it means the main task has exited and all spawned tasks
-            // will get cleaned up by tokio
-            let _ = self.committed_lsn_tx.blocking_send(*delivery_opaque);
-        }
-
-        if let Err((err, _)) = delivery_result {
-            tracing::warn!(
-                "message delivery failed for message bearing committed_lsn = {}",
-                *delivery_opaque
-            );
-
-            tracing::error!("{:?}", err)
+        match delivery_result {
+            Ok(_) => {
+                // We don't care if the send fails here as it can only fail if the receiver has been dropped.
+                // If the receiver has been dropped it means the main task has exited and all spawned tasks
+                // will get cleaned up by tokio
+                let _ = self.committed_lsn_tx.blocking_send(*delivery_opaque);
+            }
+            _ => {
+                // Since the delivery timeout is set to infinite, if a message delivery error occurs,
+                // it is due to the retry limit being exceeded. Since we also set enable.gapless.guarantee
+                // to true, this case would ensure that attempting to process any messages queued after the
+                // failed message will result in a fatal error. Therefore, we can ignore this error and simply
+                // wait for a fatal error, which is handled in the main producer loop
+            }
         }
     }
 }
@@ -77,14 +77,15 @@ impl KafkaProducer {
 
         let producer: ThreadedProducer<_> = ClientConfig::new()
             .set("bootstrap.servers", &self.brokers)
-            .set("message.timeout.ms", "5000")
+            .set("delivery.timeout.ms", "0")
             .set("max.in.flight.requests.per.connection", "5")
             .set("enable.idempotence", "true")
+            .set("enable.gapless.guarantee", "true")
             .set("acks", "all")
             .create_with_context(context)?;
 
         tokio::task::spawn_blocking(move || {
-            while let Some(msg) = msg_rx.blocking_recv() {
+            'outer: while let Some(msg) = msg_rx.blocking_recv() {
                 tracing::info!("received a message to produce to kafka");
                 tracing::info!("{:?}", msg);
 
@@ -94,7 +95,9 @@ impl KafkaProducer {
 
                 loop {
                     match producer.send(record) {
-                        Ok(()) => break,
+                        Ok(()) => {
+                            break;
+                        }
                         Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), rec)) => {
                             tracing::warn!("Send queue full, will retry");
 
@@ -102,18 +105,18 @@ impl KafkaProducer {
                             thread::sleep(Duration::from_millis(500));
                         }
                         Err((e, _)) => {
-                            tracing::warn!(
-                                "Potentially unrecoverable kafka error encountered, will panic now"
+                            tracing::error!(
+                                "Potentially unrecoverable kafka error encountered, will close the producer now"
                             );
 
                             tracing::error!("{:?}", e);
 
-                            // panicking here will cause the current task to exit, causing
+                            // breaking 'outer will cause the current task to exit, causing
                             // the receiver end of the message channel to be dropped,
                             // causing future sends to the message channel from the main task to fail
                             // at which point a recoverable error will be emitted, which will cause
                             // the programme to restart
-                            panic!()
+                            break 'outer;
                         }
                     }
                 }
