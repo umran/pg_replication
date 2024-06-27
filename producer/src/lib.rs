@@ -153,6 +153,9 @@ impl Producer {
         // kill any active pid that is already bound to the slot before attempting to start replication
         kill_active_pid(&metadata_client, slot_meta_data.active_pid).await;
 
+        // we can safely drop the metadata_client now
+        drop(metadata_client);
+
         let lsn: PgLsn = (*confirmed_flush_lsn.read().await).into();
         let query = format!(
             r#"START_REPLICATION SLOT "{}" LOGICAL {} ("proto_version" '1', "publication_names" '{}')"#,
