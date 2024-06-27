@@ -102,17 +102,18 @@ impl KafkaProducer {
                             thread::sleep(Duration::from_millis(500));
                         }
                         Err((e, _)) => {
-                            tracing::error!(
-                                "Failed to publish message to kafka, will panic {:?}",
-                                e
+                            tracing::warn!(
+                                "Potentially unrecoverable kafka error encountered, will panic now"
                             );
 
-                            // breaking here will cause the current task to exit, causing
+                            tracing::error!("{:?}", e);
+
+                            // panicking here will cause the current task to exit, causing
                             // the receiver end of the message channel to be dropped,
                             // causing future sends to the message channel from the main task to fail
                             // at which point a recoverable error will be emitted, which will cause
                             // the programme to restart
-                            break;
+                            panic!()
                         }
                     }
                 }
