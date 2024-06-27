@@ -45,7 +45,7 @@ impl ProducerContext for KafkaProducerContext {
         match delivery_result {
             Ok(_) => {
                 tracing::info!(
-                    "message with committed_lsn = {} was successfully delivered",
+                    "message with prev_lsn = {} was successfully delivered",
                     *delivery_opaque
                 );
 
@@ -60,6 +60,10 @@ impl ProducerContext for KafkaProducerContext {
                 // to true, this case would ensure that attempting to process any messages queued after the
                 // failed message will result in a fatal error. Therefore, we can ignore this error and simply
                 // wait for a fatal error, which is handled in the main producer loop
+                tracing::error!(
+                    "message delivery failed for message with prev_lsn = {}",
+                    *delivery_opaque
+                );
             }
         }
     }
@@ -111,7 +115,7 @@ impl KafkaProducer {
                         }
                         Err((e, _)) => {
                             tracing::error!(
-                                "Potentially unrecoverable kafka error encountered, will close the producer now"
+                                "Potentially unrecoverable kafka error encountered, will not attempt to produce new messages"
                             );
 
                             tracing::error!("{:?}", e);
