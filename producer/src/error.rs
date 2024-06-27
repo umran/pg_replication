@@ -7,6 +7,7 @@ pub trait ErrorExt {
     fn is_recoverable(&self) -> bool;
 }
 
+#[derive(Debug)]
 pub enum ReplicationError {
     Recoverable(anyhow::Error),
     Fatal(anyhow::Error),

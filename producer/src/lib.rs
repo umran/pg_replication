@@ -21,7 +21,7 @@ use tokio_postgres::types::PgLsn;
 use tokio_postgres::Client;
 
 use error::ReplicationError;
-use kafka_producer::{KafkaProducer, KafkaProducerMessage};
+pub use kafka_producer::{KafkaProducer, KafkaProducerMessage};
 use util::TableInfo;
 pub use util::TopicInfo;
 
@@ -133,8 +133,6 @@ impl Producer {
             util::publication_info(&metadata_client, &self.publication_name, &self.topic_map)
                 .await?;
 
-        tracing::info!("publication tables: {:?}", publication_tables);
-
         let kafka_producer = KafkaProducer::new(self.kafka_brokers.clone());
         let (msg_tx, mut committed_lsn_rx) = kafka_producer.produce()?;
 
@@ -214,8 +212,6 @@ impl Producer {
                     use LogicalReplicationMessage::*;
                     match xlog_data.data() {
                         Begin(begin) => {
-                            tracing::info!("received BEGIN message");
-
                             if tx_in_progress {
                                 return Err(ReplicationError::Fatal(anyhow!("received a begin before commit for the previous transaction! this is a bug!")));
                             }
@@ -226,8 +222,6 @@ impl Producer {
                             lsn = begin.final_lsn();
                         }
                         Insert(insert) => {
-                            tracing::info!("received INSERT message");
-
                             let rel_id = insert.rel_id();
                             let new_tuple = insert.tuple().tuple_data();
                             let row = try_fatal!(row_from_tuple_data(rel_id, new_tuple));
@@ -249,8 +243,6 @@ impl Producer {
                             seq_id += 1;
                         }
                         Update(update) => {
-                            tracing::info!("received UPDATE message");
-
                             let rel_id = update.rel_id();
 
                             let old_tuple = try_fatal!(update
@@ -291,8 +283,6 @@ impl Producer {
                             seq_id += 1;
                         }
                         Delete(delete) => {
-                            tracing::info!("received DELETE message");
-
                             let rel_id = delete.rel_id();
 
                             let old_tuple = try_fatal!(delete
@@ -320,8 +310,6 @@ impl Producer {
                             seq_id += 1;
                         }
                         Commit(_) => {
-                            tracing::info!("received COMMIT message");
-
                             tx_in_progress = false;
                         }
                         Origin(_) | Relation(_) | Type(_) => {

@@ -44,22 +44,16 @@ impl ProducerContext for KafkaProducerContext {
     ) {
         match delivery_result {
             Ok(_) => {
-                tracing::info!(
-                    "message with prev_lsn = {} was successfully delivered",
-                    *delivery_opaque
-                );
-
                 // We don't care if the send fails here as it can only fail if the receiver has been dropped.
                 // If the receiver has been dropped it means the main task has exited and all spawned tasks
                 // will get cleaned up by tokio
                 let _ = self.committed_lsn_tx.blocking_send(*delivery_opaque);
             }
             _ => {
-                // Since the delivery timeout is set to infinite, if a message delivery error occurs,
-                // it is due to the retry limit being exceeded. Since we also set enable.gapless.guarantee
-                // to true, this case would ensure that attempting to process any messages queued after the
-                // failed message will result in a fatal error. Therefore, we can ignore this error and simply
-                // wait for a fatal error, which is handled in the main producer loop
+                // Since we set enable.gapless.guarantee to true, this case would ensure that attempting to process
+                // any messages queued after the failed message will result in a fatal error. Therefore, we can
+                // ignore this error and simply wait for a fatal error, which is handled in the main producer loop
+
                 tracing::error!(
                     "message delivery failed for message with prev_lsn = {}",
                     *delivery_opaque
@@ -87,17 +81,17 @@ impl KafkaProducer {
         let producer: ThreadedProducer<_> = ClientConfig::new()
             .set("bootstrap.servers", &self.brokers)
             .set("delivery.timeout.ms", "0")
+            .set("retries", "2147483647")
             .set("max.in.flight.requests.per.connection", "5")
             .set("enable.idempotence", "true")
             .set("enable.gapless.guarantee", "true")
             .set("acks", "all")
+            .set("linger.ms", "5")
+            .set("compression.type", "lz4")
             .create_with_context(context)?;
 
         tokio::task::spawn_blocking(move || {
             'outer: while let Some(msg) = msg_rx.blocking_recv() {
-                tracing::info!("received a message to produce to kafka");
-                tracing::info!("{:?}", msg);
-
                 let mut record = BaseRecord::with_opaque_to(&msg.topic, Box::new(msg.prev_lsn))
                     .key(&msg.partition_key)
                     .payload(&msg.payload);
