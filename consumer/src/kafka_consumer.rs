@@ -135,46 +135,59 @@ impl<T: Handler> KafkaConsumer<T> {
     }
 
     async fn handle_message(&self, msg: BorrowedMessage<'_>) -> Result<(), ReplicationError> {
-        match msg.payload_view::<str>() {
-            Some(Ok(payload)) => {
-                let payload: T::Payload = serde_json::from_str(payload).map_err(|_| {
-                    tracing::error!(
-                        "Unable to deserialize payload into expected handler payload type"
-                    );
-                    ReplicationError::Fatal(anyhow!(
-                        "Unable to deserialize payload into expected handler payload type"
-                    ))
-                })?;
+        let payload = self.extract_payload(&msg)?;
 
-                let message = HandlerMessage {
-                    topic: msg.topic(),
-                    partition: msg.partition(),
-                    payload,
-                };
+        let message = HandlerMessage {
+            topic: msg.topic(),
+            partition: msg.partition(),
+            payload,
+        };
 
-                match self.handler.handle_message(message).await {
-                    Ok(()) => {
-                        self.consumer
-                            .commit_message(&msg, rdkafka::consumer::CommitMode::Async)?;
-                    }
-                    Err(ReplicationError::Recoverable(err)) => {
-                        tracing::warn!("Handler reported a recoverable error: {}", err);
-                    }
-                    Err(ReplicationError::Fatal(err)) => {
-                        // an unrecoverable error has occurred downstream
-                        // this implies either there is a bug in the downstream application
-                        // or the message is invalid. Either case warrants a sev_1 investigation
-
-                        tracing::error!("Handler reported an unrecoverable error in processing the message, will not process any more messages from this partition, {}", err);
-                        return Err(ReplicationError::Fatal(anyhow!("Handler reported an unrecoverable error in processing the message, will not process any more messages from this partition, {}", err)));
-                    }
-                };
+        match self.handler.handle_message(message).await {
+            Ok(()) => {
+                self.consumer
+                    .commit_message(&msg, rdkafka::consumer::CommitMode::Async)?;
 
                 Ok(())
             }
-            _ => {
-                tracing::error!("Invalid payload received. Topic considered corrupted, will exit");
+            Err(ReplicationError::Recoverable(err)) => {
+                tracing::warn!(
+                    "Handler reported a recoverable error: {}, we will simply retry the message",
+                    err
+                );
 
+                Ok(())
+            }
+            Err(ReplicationError::Fatal(err)) => {
+                // an unrecoverable error has occurred downstream
+                // this implies either there is a bug in the downstream application
+                // or the message is invalid. Either case warrants a sev_1 investigation
+                tracing::error!("Handler reported an unrecoverable error in processing the message, will not process any more messages from this partition, {}", err);
+
+                Err(ReplicationError::Fatal(anyhow!("Handler reported an unrecoverable error in processing the message, will not process any more messages from this partition, {}", err)))
+            }
+        }
+
+        // Ok(())
+    }
+
+    fn extract_payload(&self, msg: &BorrowedMessage) -> Result<T::Payload, ReplicationError> {
+        match msg.payload_view::<str>() {
+            Some(Ok(payload)) => serde_json::from_str(payload).map_err(|_| {
+                tracing::error!("Unable to deserialize payload into expected handler payload type");
+                ReplicationError::Fatal(anyhow!(
+                    "Unable to deserialize payload into expected handler payload type"
+                ))
+            }),
+            Some(Err(err)) => {
+                tracing::error!(
+                    "Failed to parse message into intermediate utf8. This is a fatal error: {}",
+                    err
+                );
+                return Err(ReplicationError::Fatal(anyhow!("Invalid payload")));
+            }
+            None => {
+                tracing::error!("No payload received. This is a fatal error");
                 return Err(ReplicationError::Fatal(anyhow!("Invalid payload")));
             }
         }
