@@ -184,16 +184,14 @@ impl Consumer {
         Ok(tx)
     }
 
-    async fn create_and_commit_partition_state(
+    async fn commit_partition_state(
         &self,
-        mut tx: Transaction<'_, Postgres>,
+        tx: Transaction<'_, Postgres>,
         topic: &str,
         partition: i32,
         lsn: u64,
         seq_id: u64,
     ) -> Result<(), ReplicationError> {
-        self.create_partition_state(&mut tx, topic, partition, lsn, seq_id)
-            .await?;
         match tx.commit().await {
             Ok(_) => {
                 self.set_cached_partition_state(topic, partition, lsn, seq_id)
@@ -202,37 +200,6 @@ impl Consumer {
             }
             Err(err) => {
                 tracing::warn!("transaction commit failure. the database partition state is unknown, invalidating local cache: {}", err);
-
-                self.delete_cached_partition_state(topic, partition).await;
-
-                Err(ReplicationError::Recoverable(anyhow!(
-                    "db commit failure, treating this as a recoverable error: {}",
-                    err
-                )))
-            }
-        }
-    }
-
-    async fn update_and_commit_partition_state(
-        &self,
-        mut tx: Transaction<'_, Postgres>,
-        topic: &str,
-        partition: i32,
-        lsn: u64,
-        seq_id: u64,
-    ) -> Result<(), ReplicationError> {
-        self.update_partition_state(&mut tx, topic, partition, lsn, seq_id)
-            .await?;
-
-        match tx.commit().await {
-            Ok(_) => {
-                self.set_cached_partition_state(topic, partition, lsn, seq_id)
-                    .await;
-                Ok(())
-            }
-            Err(err) => {
-                tracing::warn!("transaction commit failure. the database partition state is unknown, invalidating local cache: {}", err);
-
                 self.delete_cached_partition_state(topic, partition).await;
 
                 Err(ReplicationError::Recoverable(anyhow!(
@@ -269,14 +236,17 @@ impl Handler for Consumer {
             self.process_payload(&mut tx, &msg.payload).await?;
 
             // update and commit partition state
-            self.update_and_commit_partition_state(
-                tx,
+            self.update_partition_state(
+                &mut tx,
                 topic,
                 partition,
                 msg.payload.lsn,
                 msg.payload.seq_id,
             )
             .await?;
+
+            self.commit_partition_state(tx, topic, partition, msg.payload.lsn, msg.payload.seq_id)
+                .await?;
 
             return Ok(());
         }
@@ -299,8 +269,8 @@ impl Handler for Consumer {
             self.process_payload(&mut tx, &msg.payload).await?;
 
             // update and commit partition state
-            self.update_and_commit_partition_state(
-                tx,
+            self.update_partition_state(
+                &mut tx,
                 topic,
                 partition,
                 msg.payload.lsn,
@@ -308,19 +278,27 @@ impl Handler for Consumer {
             )
             .await?;
 
+            self.commit_partition_state(tx, topic, partition, msg.payload.lsn, msg.payload.seq_id)
+                .await?;
+
             return Ok(());
         }
 
         // state is not present in database
         self.process_payload(&mut tx, &msg.payload).await?;
-        self.create_and_commit_partition_state(
-            tx,
+
+        // create and commit the partition state
+        self.create_partition_state(
+            &mut tx,
             topic,
             partition,
             msg.payload.lsn,
             msg.payload.seq_id,
         )
         .await?;
+
+        self.commit_partition_state(tx, topic, partition, msg.payload.lsn, msg.payload.seq_id)
+            .await?;
 
         Ok(())
     }
