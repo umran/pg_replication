@@ -5,19 +5,23 @@ use async_trait::async_trait;
 use rdkafka::{
     config::RDKafkaLogLevel,
     consumer::{Consumer, ConsumerContext, Rebalance, StreamConsumer},
+    message::BorrowedMessage,
     ClientConfig, ClientContext, Message,
 };
 use serde::Deserialize;
 
 use producer::error::ReplicationError;
 
-pub struct KafkaConsumer {
+pub struct KafkaConsumer<T: Handler> {
     /// the id of the consumer group to which this consumer belongs
     pub group_id: String,
     /// the kafka brokers to connect to
     pub brokers: String,
     /// the kafka topics this consumer should subscribe to
     pub topics: Vec<String>,
+
+    consumer: Arc<StreamConsumer<KafkaConsumerContext<T>>>,
+    handler: Arc<T>,
 }
 
 struct KafkaConsumerContext<T: Handler> {
@@ -73,16 +77,13 @@ impl<T: Handler> ConsumerContext for KafkaConsumerContext<T> {
     }
 }
 
-impl KafkaConsumer {
-    pub fn new(group_id: String, brokers: String, topics: Vec<String>) -> Self {
-        Self {
-            group_id,
-            brokers,
-            topics,
-        }
-    }
-
-    pub async fn consume<T: Handler>(&self, handler: T) -> Result<(), ReplicationError> {
+impl<T: Handler> KafkaConsumer<T> {
+    pub fn new(
+        group_id: String,
+        brokers: String,
+        topics: Vec<String>,
+        handler: T,
+    ) -> Result<Self, ReplicationError> {
         let handler = Arc::new(handler);
 
         let context = KafkaConsumerContext {
@@ -90,65 +91,37 @@ impl KafkaConsumer {
         };
 
         let consumer: StreamConsumer<KafkaConsumerContext<T>> = ClientConfig::new()
-            .set("group.id", &self.group_id)
-            .set("bootstrap.servers", &self.brokers)
+            .set("group.id", &group_id)
+            .set("bootstrap.servers", &brokers)
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "6000")
             .set("enable.auto.commit", "false")
             .set_log_level(RDKafkaLogLevel::Debug)
             .create_with_context(context)?;
 
+        let consumer = Arc::new(consumer);
+
+        Ok(Self {
+            group_id,
+            brokers,
+            topics,
+            consumer,
+            handler,
+        })
+    }
+
+    pub async fn consume(&self) -> Result<(), ReplicationError> {
         let topics: &[&str] = &self
             .topics
             .iter()
             .map(|topic| topic.as_str())
             .collect::<Vec<_>>();
 
-        consumer.subscribe(topics)?;
+        self.consumer.subscribe(topics)?;
 
         loop {
-            match consumer.recv().await {
-                Ok(msg) => {
-                    match msg.payload_view::<str>() {
-                        Some(Ok(payload)) => {
-                            let payload: T::Payload = serde_json::from_str(payload).map_err(|_| {
-                                tracing::error!("Unable to deserialize payload into expected handler payload type");
-                                ReplicationError::Fatal(anyhow!(
-                                    "Unable to deserialize payload into expected handler payload type"
-                                ))
-                            })?;
-
-                            let message = HandlerMessage {
-                                topic: msg.topic(),
-                                partition: msg.partition(),
-                                payload,
-                            };
-
-                            match handler.handle_message(message).await {
-                                Ok(()) => consumer
-                                    .commit_message(&msg, rdkafka::consumer::CommitMode::Async)?,
-                                Err(ReplicationError::Recoverable(err)) => {
-                                    tracing::warn!("Handler reported a recoverable error: {}", err);
-                                }
-                                Err(ReplicationError::Fatal(err)) => {
-                                    // an unrecoverable error has occurred downstream
-                                    // this implies either there is a bug in the downstream application
-                                    // or the message is invalid. Either case warrants a sev_1 investigation
-
-                                    tracing::error!("Handler reported an unrecoverable error in processing the message, will not process any more messages from this partition, {}", err);
-                                    return Err(ReplicationError::Fatal(anyhow!("Handler reported an unrecoverable error in processing the message, will not process any more messages from this partition, {}", err)));
-                                }
-                            }
-                        }
-                        _ => {
-                            tracing::error!(
-                                "Invalid payload received. Topic considered corrupted, will exit"
-                            );
-
-                            return Err(ReplicationError::Fatal(anyhow!("Invalid payload")));
-                        }
-                    }
-                }
+            match self.consumer.recv().await {
+                Ok(msg) => self.handle_message(msg).await?,
                 Err(err) => {
                     // potentially fatal error
                     tracing::error!("Potentially fatal kafka error: {}", err);
@@ -157,6 +130,52 @@ impl KafkaConsumer {
                         "Potentially fatal kafka error"
                     )));
                 }
+            }
+        }
+    }
+
+    async fn handle_message(&self, msg: BorrowedMessage<'_>) -> Result<(), ReplicationError> {
+        match msg.payload_view::<str>() {
+            Some(Ok(payload)) => {
+                let payload: T::Payload = serde_json::from_str(payload).map_err(|_| {
+                    tracing::error!(
+                        "Unable to deserialize payload into expected handler payload type"
+                    );
+                    ReplicationError::Fatal(anyhow!(
+                        "Unable to deserialize payload into expected handler payload type"
+                    ))
+                })?;
+
+                let message = HandlerMessage {
+                    topic: msg.topic(),
+                    partition: msg.partition(),
+                    payload,
+                };
+
+                match self.handler.handle_message(message).await {
+                    Ok(()) => {
+                        self.consumer
+                            .commit_message(&msg, rdkafka::consumer::CommitMode::Async)?;
+                    }
+                    Err(ReplicationError::Recoverable(err)) => {
+                        tracing::warn!("Handler reported a recoverable error: {}", err);
+                    }
+                    Err(ReplicationError::Fatal(err)) => {
+                        // an unrecoverable error has occurred downstream
+                        // this implies either there is a bug in the downstream application
+                        // or the message is invalid. Either case warrants a sev_1 investigation
+
+                        tracing::error!("Handler reported an unrecoverable error in processing the message, will not process any more messages from this partition, {}", err);
+                        return Err(ReplicationError::Fatal(anyhow!("Handler reported an unrecoverable error in processing the message, will not process any more messages from this partition, {}", err)));
+                    }
+                };
+
+                Ok(())
+            }
+            _ => {
+                tracing::error!("Invalid payload received. Topic considered corrupted, will exit");
+
+                return Err(ReplicationError::Fatal(anyhow!("Invalid payload")));
             }
         }
     }
