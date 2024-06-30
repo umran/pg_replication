@@ -1,6 +1,6 @@
-mod error;
+pub mod error;
 mod kafka_producer;
-mod util;
+pub mod util;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,7 +59,8 @@ pub struct Producer {
 
 #[derive(Serialize, Deserialize)]
 pub struct ReplicationOp {
-    pub rel_id: u32,
+    pub table_name: String,
+    pub col_names: Vec<String>,
     pub lsn: u64,
     pub seq_id: u64,
     pub op: Op,
@@ -498,7 +499,8 @@ fn message_from_op(
     .join("");
 
     let payload = ReplicationOp {
-        rel_id,
+        table_name: table_info.name.clone(),
+        col_names: table_info.col_names.clone(),
         lsn,
         seq_id,
         op,
@@ -513,7 +515,7 @@ fn message_from_op(
     Ok(KafkaProducerMessage {
         topic,
         partition_key,
-        prev_lsn,
+        offset: prev_lsn,
         payload,
     })
 }

@@ -21,14 +21,14 @@ pub struct KafkaProducer {
 
 #[derive(Clone)]
 struct KafkaProducerContext {
-    committed_lsn_tx: Sender<u64>,
+    committed_offset_tx: Sender<u64>,
 }
 
 #[derive(Debug)]
 pub struct KafkaProducerMessage {
     pub topic: String,
     pub partition_key: String,
-    pub prev_lsn: u64,
+    pub offset: u64,
     pub payload: String,
 }
 
@@ -46,7 +46,7 @@ impl ProducerContext for KafkaProducerContext {
             Ok(_) => {
                 // We don't care if the send fails here as it can only fail if the receiver has been dropped.
                 // If the receiver has been dropped it means the main task has exited
-                let _ = self.committed_lsn_tx.blocking_send(*delivery_opaque);
+                let _ = self.committed_offset_tx.blocking_send(*delivery_opaque);
             }
             _ => {
                 // Since we set enable.gapless.guarantee to true, this case would ensure that attempting to process
@@ -54,7 +54,7 @@ impl ProducerContext for KafkaProducerContext {
                 // ignore this error and simply wait for a fatal error, which is handled in the main producer loop
 
                 tracing::error!(
-                    "message delivery failed for message with prev_lsn = {}",
+                    "message delivery failed for message with offset = {}",
                     *delivery_opaque
                 );
             }
@@ -73,9 +73,11 @@ impl KafkaProducer {
         let (msg_tx, mut msg_rx): (Sender<KafkaProducerMessage>, Receiver<KafkaProducerMessage>) =
             mpsc::channel(1);
 
-        let (committed_lsn_tx, committed_lsn_rx) = mpsc::channel(1);
+        let (committed_offset_tx, committed_offset_rx) = mpsc::channel(1);
 
-        let context = KafkaProducerContext { committed_lsn_tx };
+        let context = KafkaProducerContext {
+            committed_offset_tx,
+        };
 
         let producer: ThreadedProducer<_> = ClientConfig::new()
             .set("bootstrap.servers", &self.brokers)
@@ -91,7 +93,7 @@ impl KafkaProducer {
 
         tokio::task::spawn_blocking(move || {
             'outer: while let Some(msg) = msg_rx.blocking_recv() {
-                let mut record = BaseRecord::with_opaque_to(&msg.topic, Box::new(msg.prev_lsn))
+                let mut record = BaseRecord::with_opaque_to(&msg.topic, Box::new(msg.offset))
                     .key(&msg.partition_key)
                     .payload(&msg.payload);
 
@@ -125,6 +127,6 @@ impl KafkaProducer {
             }
         });
 
-        Ok((msg_tx, committed_lsn_rx))
+        Ok((msg_tx, committed_offset_rx))
     }
 }

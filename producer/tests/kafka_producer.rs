@@ -17,12 +17,12 @@ async fn it_produces_messages() {
     tokio::spawn(async move {
         tracing::info!("queueing {} 144 byte payloads", n);
 
-        for prev_lsn in 1..=n {
+        for offset in 1..=n {
             tx_clone
                 .send(KafkaProducerMessage {
                     topic: "test".into(),
                     partition_key: "some_key".into(),
-                    prev_lsn,
+                    offset,
                     payload: payload.clone(),
                 })
                 .await

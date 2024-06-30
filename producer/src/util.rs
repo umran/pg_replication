@@ -31,6 +31,9 @@ pub struct TableInfo {
     pub topic: String,
     /// The schema of each column, in order
     pub schema: Vec<Column>,
+    /// The list of column names, in the expected order for
+    /// decoding logical replication
+    pub col_names: Vec<String>,
 }
 
 /// Information about a table column
@@ -249,6 +252,8 @@ pub async fn publication_info(
             return Err(ReplicationError::Fatal(anyhow!("at least one column defined as a partition key in TopicInfo does not exist on the table")));
         }
 
+        let col_names = schema.iter().map(|col| col.name.clone()).collect();
+
         table_infos.insert(
             rel_id,
             TableInfo {
@@ -256,6 +261,7 @@ pub async fn publication_info(
                 namespace,
                 name,
                 schema,
+                col_names,
                 topic: topic_info.name.clone(),
             },
         );
