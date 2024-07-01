@@ -97,6 +97,8 @@ impl KafkaProducer {
                     .key(&msg.partition_key)
                     .payload(&msg.payload);
 
+                tracing::info!("producing record: {:?}", record);
+
                 loop {
                     match producer.send(record) {
                         Ok(()) => {

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -13,13 +13,6 @@ use serde::Deserialize;
 use producer::error::ReplicationError;
 
 pub struct KafkaConsumer<T: Handler> {
-    /// the id of the consumer group to which this consumer belongs
-    pub group_id: String,
-    /// the kafka brokers to connect to
-    pub brokers: String,
-    /// the kafka topics this consumer should subscribe to
-    pub topics: Vec<String>,
-
     consumer: Arc<StreamConsumer<KafkaConsumerContext<T>>>,
     handler: Arc<T>,
 }
@@ -34,7 +27,7 @@ pub trait Handler: Sync + Send + 'static {
 
     async fn handle_message(
         &self,
-        message: HandlerMessage<'_, Self::Payload>,
+        message: &HandlerMessage<'_, Self::Payload>,
     ) -> Result<(), ReplicationError>;
 
     fn assign_partitions(&self, _: Vec<(&str, i32)>) {}
@@ -79,9 +72,9 @@ impl<T: Handler> ConsumerContext for KafkaConsumerContext<T> {
 
 impl<T: Handler> KafkaConsumer<T> {
     pub fn new(
-        group_id: String,
-        brokers: String,
-        topics: Vec<String>,
+        group_id: &str,
+        brokers: &str,
+        topics: &Vec<String>,
         handler: T,
     ) -> Result<Self, ReplicationError> {
         let handler = Arc::new(handler);
@@ -91,35 +84,33 @@ impl<T: Handler> KafkaConsumer<T> {
         };
 
         let consumer: StreamConsumer<KafkaConsumerContext<T>> = ClientConfig::new()
-            .set("group.id", &group_id)
-            .set("bootstrap.servers", &brokers)
+            .set("group.id", group_id)
+            .set("bootstrap.servers", brokers)
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "6000")
-            .set("enable.auto.commit", "false")
+            // Commit automatically every 5 seconds
+            .set("enable.auto.commit", "true")
+            .set("auto.commit.interval.ms", "5000")
+            // but only commit the offsets explicitly stored via `consumer.store_offset`.
+            .set("enable.auto.offset.store", "false")
             .set_log_level(RDKafkaLogLevel::Debug)
             .create_with_context(context)?;
 
-        let consumer = Arc::new(consumer);
-
-        Ok(Self {
-            group_id,
-            brokers,
-            topics,
-            consumer,
-            handler,
-        })
-    }
-
-    pub async fn consume(&self) -> Result<(), ReplicationError> {
-        let topics: &[&str] = &self
-            .topics
+        let topics = topics
             .iter()
             .map(|topic| topic.as_str())
             .collect::<Vec<_>>();
 
-        self.consumer.subscribe(topics)?;
+        consumer.subscribe(&topics)?;
 
+        let consumer = Arc::new(consumer);
+
+        Ok(Self { consumer, handler })
+    }
+
+    pub async fn consume(&self) -> Result<(), ReplicationError> {
         loop {
+            tracing::info!("polling for messages");
             match self.consumer.recv().await {
                 Ok(msg) => self.handle_message(msg).await?,
                 Err(err) => {
@@ -143,32 +134,36 @@ impl<T: Handler> KafkaConsumer<T> {
             payload,
         };
 
-        match self.handler.handle_message(message).await {
-            Ok(()) => {
-                self.consumer
-                    .commit_message(&msg, rdkafka::consumer::CommitMode::Async)?;
+        loop {
+            match self.handler.handle_message(&message).await {
+                Ok(()) => {
+                    self.consumer.store_offset_from_message(&msg).map_err(|err| {
+                        tracing::warn!("unable to set offset in store, this is a recoverable error, will retry: {}", err);
+                        ReplicationError::Recoverable(anyhow!("Failed to set offset in store, this is a recoverable error: {}", err))
+                    })?;
 
-                Ok(())
-            }
-            Err(ReplicationError::Recoverable(err)) => {
-                tracing::warn!(
-                    "Handler reported a recoverable error: {}, we will simply retry the message",
-                    err
-                );
+                    break;
+                }
+                Err(ReplicationError::Recoverable(err)) => {
+                    tracing::warn!(
+                        "Handler reported a recoverable error: {}, we will simply retry the message after a delay",
+                        err
+                    );
 
-                Ok(())
-            }
-            Err(ReplicationError::Fatal(err)) => {
-                // an unrecoverable error has occurred downstream
-                // this implies either there is a bug in the downstream application
-                // or the message is invalid. Either case warrants a sev_1 investigation
-                tracing::error!("Handler reported an unrecoverable error in processing the message, will not process any more messages from this partition, {}", err);
-
-                Err(ReplicationError::Fatal(anyhow!("Handler reported an unrecoverable error in processing the message, will not process any more messages from this partition, {}", err)))
+                    // this will block the current task
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+                Err(ReplicationError::Fatal(err)) => {
+                    // an unrecoverable error has occurred downstream
+                    // this implies either there is a bug in the downstream application
+                    // or the producer of the message is invalid. Either case warrants a sev_1 investigation
+                    tracing::error!("Handler reported an unrecoverable error in processing the message, will not process any more messages from this partition, {}", err);
+                    return Err(ReplicationError::Fatal(anyhow!("Handler reported an unrecoverable error in processing the message, will not process any more messages from this partition, {}", err)));
+                }
             }
         }
 
-        // Ok(())
+        Ok(())
     }
 
     fn extract_payload(&self, msg: &BorrowedMessage) -> Result<T::Payload, ReplicationError> {
