@@ -14,13 +14,13 @@ use crate::kafka_consumer::{Handler, HandlerMessage};
 
 use state::State;
 
-use super::Application;
+use super::IdempotentApplication;
 
 /// IdempotentConsumer processes messages from a given set of topics in partition order. In order to ensure idempotency of
 /// message processing, the consumer (defined by the consumer_group_id) must keep track of the latest
 /// lsn and seq_no processed per topic per partition. In order to preserve idempotency, this state
 /// must be read from and written to within the same transaction as any writes that occur as a result of side-effects from processing the message
-pub struct IdempotentConsumer<App: Application> {
+pub struct IdempotentConsumer<App: IdempotentApplication> {
     /// the id of the consumer group to which this consumer belongs
     pub group_id: String,
 
@@ -29,7 +29,7 @@ pub struct IdempotentConsumer<App: Application> {
     app: Arc<App>,
 }
 
-impl<App: Application> IdempotentConsumer<App> {
+impl<App: IdempotentApplication> IdempotentConsumer<App> {
     pub async fn new(
         group_id: &str,
         connection_string: &str,
@@ -245,7 +245,7 @@ impl<App: Application> IdempotentConsumer<App> {
 }
 
 #[async_trait::async_trait]
-impl<App: Application> Handler for IdempotentConsumer<App> {
+impl<App: IdempotentApplication> Handler for IdempotentConsumer<App> {
     type Payload = ReplicationOp;
 
     async fn handle_message(
@@ -263,7 +263,11 @@ impl<App: Application> Handler for IdempotentConsumer<App> {
 
         if let Some((lsn, seq_id)) = self.get_cached_partition_state(topic, partition) {
             if is_processed_payload(&msg.payload, lsn, seq_id) {
-                tracing::info!("skipping already processed message: {}_{}", lsn, seq_id);
+                tracing::info!(
+                    "skipping already processed message: {}_{}",
+                    &msg.payload.lsn,
+                    &msg.payload.seq_id
+                );
 
                 return Ok(());
             }
@@ -297,7 +301,11 @@ impl<App: Application> Handler for IdempotentConsumer<App> {
             self.set_cached_partition_state(topic, partition, lsn, seq_id);
 
             if is_processed_payload(&msg.payload, lsn, seq_id) {
-                tracing::info!("skipping already processed message: {}_{}", lsn, seq_id);
+                tracing::info!(
+                    "skipping already processed message: {}_{}",
+                    &msg.payload.lsn,
+                    &msg.payload.seq_id
+                );
 
                 return Ok(());
             }

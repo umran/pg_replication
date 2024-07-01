@@ -46,6 +46,10 @@ impl<T: Handler> ConsumerContext for KafkaConsumerContext<T> {
     fn post_rebalance<'a>(&self, rebalance: &rdkafka::consumer::Rebalance<'a>) {
         match rebalance {
             Rebalance::Assign(assignments) => {
+                if assignments.capacity() == 0 {
+                    return;
+                }
+
                 let ass = assignments.elements();
                 let ass = ass
                     .iter()
@@ -55,6 +59,10 @@ impl<T: Handler> ConsumerContext for KafkaConsumerContext<T> {
                 self.handler.assign_partitions(ass);
             }
             Rebalance::Revoke(revocations) => {
+                if revocations.capacity() == 0 {
+                    return;
+                }
+
                 let rev = revocations.elements();
                 let rev = rev
                     .iter()
@@ -85,6 +93,7 @@ impl<T: Handler> KafkaConsumer<T> {
 
         let consumer: StreamConsumer<KafkaConsumerContext<T>> = ClientConfig::new()
             .set("group.id", group_id)
+            // .set("auto.offset.reset", "latest")
             .set("bootstrap.servers", brokers)
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "6000")
@@ -168,12 +177,19 @@ impl<T: Handler> KafkaConsumer<T> {
 
     fn extract_payload(&self, msg: &BorrowedMessage) -> Result<T::Payload, ReplicationError> {
         match msg.payload_view::<str>() {
-            Some(Ok(payload)) => serde_json::from_str(payload).map_err(|_| {
-                tracing::error!("Unable to deserialize payload into expected handler payload type");
-                ReplicationError::Fatal(anyhow!(
-                    "Unable to deserialize payload into expected handler payload type"
-                ))
-            }),
+            Some(Ok(payload)) => {
+                tracing::info!("received the following payload");
+                tracing::info!("{}", payload);
+
+                serde_json::from_str(payload).map_err(|_| {
+                    tracing::error!(
+                        "Unable to deserialize payload into expected handler payload type"
+                    );
+                    ReplicationError::Fatal(anyhow!(
+                        "Unable to deserialize payload into expected handler payload type"
+                    ))
+                })
+            }
             Some(Err(err)) => {
                 tracing::error!(
                     "Failed to parse message into intermediate utf8. This is a fatal error: {}",
