@@ -16,3 +16,4 @@ lazy_static.workspace = true
 tracing.workspace = true
 rdkafka.workspace = true
 tokio.workspace = true
+tracing-subscriber.workspace = true

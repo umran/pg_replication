@@ -57,7 +57,7 @@ pub struct Producer {
     topic_map: HashMap<String, TopicInfo>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ReplicationOp {
     pub table_name: String,
     pub col_names: Vec<String>,
@@ -66,7 +66,7 @@ pub struct ReplicationOp {
     pub op: Op,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum Op {
     Insert(Row),
     Update((Row, Row)),
@@ -99,7 +99,7 @@ impl Producer {
         }
     }
 
-    pub async fn start(&self) -> Result<(), anyhow::Error> {
+    pub async fn start(self) -> Result<(), anyhow::Error> {
         loop {
             match self.start_replication().await {
                 Err(ReplicationError::Recoverable(e)) => {
