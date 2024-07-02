@@ -4,6 +4,9 @@ use producer::{Producer, TopicInfo};
 
 #[tokio::main]
 async fn main() {
+    let subscriber = tracing_subscriber::FmtSubscriber::new();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+
     start_producer().await
 }
 

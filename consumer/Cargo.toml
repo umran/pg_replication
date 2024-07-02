@@ -11,6 +11,7 @@ serde_json.workspace = true
 sqlx.workspace = true
 rdkafka.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 tokio.workspace = true
 futures.workspace = true
 uuid.workspace = true
